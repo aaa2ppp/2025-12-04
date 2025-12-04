@@ -1,0 +1,14 @@
+.*
+!.gitignore
+.exe
+.out
+.bin
+.pprof
+.*/
+tmp/
+bin/
+bak/
+bak[0-9]/
+data/
+idea/
+todo/
