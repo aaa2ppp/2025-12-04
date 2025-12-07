@@ -1,10 +1,9 @@
 package app
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -47,15 +46,12 @@ func (a *App) Run(cfg config.Config) error {
 		s := <-c
 		_ = s
 
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-		defer cancel()
-
-		if err := srv.Shutdown(ctx); err != nil {
+		if err := srv.Shutdown(); err != nil {
 			done <- err
 		}
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server: %w", err)
 	}
 

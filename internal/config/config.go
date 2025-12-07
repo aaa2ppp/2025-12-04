@@ -1,9 +1,11 @@
 package config
 
-import "time"
+import (
+	"link-checker/internal/server"
+)
 
 type Config struct {
-	ShutdownTimeout time.Duration
+	Server server.Config
 	// TODO
 }
 
