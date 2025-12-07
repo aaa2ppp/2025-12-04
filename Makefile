@@ -69,12 +69,9 @@ clean:
 
 .PHONY: merge patch
 
-MERGE_FIND_PARTS := $(patsubst %,-o -name '%',$(MERGE_FILES))
-MERGE_FIND_EXPR := $(wordlist 2,$(words $(MERGE_FIND_PARTS)),$(MERGE_FIND_PARTS))
-
 merge: ${TMP_DIR}
 	@find $(SRC) -type f \( $(MERGE_FIND_EXPR) \) -exec sh -c 'name="{}"; \
-		printf "== $${name#./} ==\n\n"; cat $$name; echo' ';' > $(TMP_DIR)/$(DST).code
+		printf "== $${name#./} ==\n\n"; cat "$$name"; echo' ';' > $(TMP_DIR)/$(DST).code
 	@echo "Merge saved to $(TMP_DIR)/$(DST).code"	
 	
 
