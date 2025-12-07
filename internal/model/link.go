@@ -1,10 +1,11 @@
 package model
 
 type Link struct {
-	Name      string
-	URL       string
-	Available bool
-	Reason    string
+	Name       string
+	URL        string
+	Available  bool
+	StatusCode int
+	Reason     string
 }
 
 type LinkSet struct {
