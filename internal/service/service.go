@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"strings"
 
 	"link-checker/internal/api"
 	"link-checker/internal/model"
@@ -14,7 +13,7 @@ type LinkStorage interface {
 }
 
 type ReportBuilder interface {
-	Build(ctx context.Context, linkSets []model.LinkSet) model.Report
+	Build(ctx context.Context, linkSets []model.LinkSet) (model.Report, error)
 }
 
 type URLChecker interface {
@@ -40,12 +39,12 @@ func (s *Service) CheckLinks(ctx context.Context, links []string) (model.LinkSet
 	return model.LinkSet{}, nil
 }
 
-func (s *Service) Report(ctx context.Context, linkSetIDs []uint64) model.Report {
+func (s *Service) Report(ctx context.Context, linkSetIDs []uint64) (model.Report, error) {
 	// TODO
 	return model.Report{
 		ContentType: "plain/text",
-		Reader:      strings.NewReader("unimplemented"),
-	}
+		Body:        []byte("unimplemented"),
+	}, nil
 }
 
 var (

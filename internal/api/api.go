@@ -12,7 +12,7 @@ type LinkChecker interface {
 }
 
 type Reporter interface {
-	Report(ctx context.Context, linkSetIDs []uint64) model.Report
+	Report(ctx context.Context, linkSetIDs []uint64) (model.Report, error)
 }
 
 type Service interface {

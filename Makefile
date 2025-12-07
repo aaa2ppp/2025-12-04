@@ -18,13 +18,15 @@ BINARIES := $(patsubst cmd/%,$(BIN_DIR)/%,$(CMDS))
 MERGE_FILES ?= Makefile go.mod go.sum *.go *.sh *.md *.example
 MERGE_EXCLUDE_DIRS ?= .* tmp bak bak[0-9] bin data idea
 
-MERGE_FIND_PARTS := $(patsubst %,-o -name '%',$(MERGE_FILES))
-MERGE_FIND_EXPR := $(wordlist 2,$(words $(MERGE_FIND_PARTS)),$(MERGE_FIND_PARTS))
+MERGE_FIND_PARTS   := $(patsubst %,-o -name '%',$(MERGE_FILES))
+MERGE_FIND_EXPR    := $(wordlist 2,$(words $(MERGE_FIND_PARTS)),$(MERGE_FIND_PARTS))
 MERGE_EXCLUDE_EXPR := $(patsubst %,! -path '*/%/*',$(MERGE_EXCLUDE_DIRS))
 
 # source and destination for merge/patch operations
 SRC ?= .
 DST ?= 1
+
+REPORT_SIZE ?= medium # small, medium, large
 
 
 .PHONY: FORCE all deps test build clean run
@@ -57,6 +59,9 @@ $(BIN_DIR)/%: ${BIN_DIR} FORCE
 	go build $(GO_BUILD_FLAGS) -o $@$(GOEXE) ./cmd/$(notdir $@)
 
 build: $(BINARIES)
+
+test-report: bin/json2pdf $(TMP_DIR)
+	bin/json2pdf -generate -size=$(REPORT_SIZE) | bin/json2pdf > $(TMP_DIR)/$(DST).pdf
 
 # Очистка
 clean:
