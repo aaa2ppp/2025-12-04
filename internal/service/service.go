@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 
 	"link-checker/internal/api"
 	"link-checker/internal/model"
@@ -34,17 +35,44 @@ func New(storage LinkStorage, checker URLChecker, builder ReportBuilder) *Servic
 	}
 }
 
-func (s *Service) CheckLinks(ctx context.Context, links []string) (model.LinkSet, error) {
-	// TODO
-	return model.LinkSet{}, nil
+func (s *Service) CheckLinks(ctx context.Context, rawLinks []string) (model.LinkSet, error) {
+	links, err := s.checker.Check(ctx, rawLinks)
+	if err != nil {
+		return model.LinkSet{}, err
+	}
+
+	id, err := s.storage.Save(ctx, links)
+	if err != nil {
+		return model.LinkSet{}, err
+	}
+
+	return model.LinkSet{
+		ID:    id,
+		Links: links,
+	}, nil
 }
 
 func (s *Service) Report(ctx context.Context, linkSetIDs []uint64) (model.Report, error) {
-	// TODO
-	return model.Report{
-		ContentType: "plain/text",
-		Body:        []byte("unimplemented"),
-	}, nil
+	linkSets := make([]model.LinkSet, 0, len(linkSetIDs))
+
+	for _, id := range linkSetIDs {
+		linkSet, err := s.storage.Load(ctx, id)
+		if err != nil {
+			if errors.Is(err, model.ErrNotFound) {
+				linkSets = append(linkSets, model.LinkSet{
+					ID:    id,
+					Links: []model.Link{{Name: "unknown", Reason: err.Error()}}, // TODO: maybe add LinkSet.Err field?
+				})
+				continue
+			}
+
+			return model.Report{}, err
+		}
+		
+		linkSets = append(linkSets, linkSet)
+	}
+
+	return s.builder.Build(ctx, linkSets)
 }
 
 var (

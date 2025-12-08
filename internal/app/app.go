@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"link-checker/internal/api"
 	"link-checker/internal/checker"
 	"link-checker/internal/config"
+	"link-checker/internal/logger"
 	"link-checker/internal/report"
 	"link-checker/internal/server"
 	"link-checker/internal/service"
@@ -26,7 +28,11 @@ func (a *App) Run(cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("open storage: %w", err)
 	}
-	defer storage.Close()
+	defer func() {
+		if err := storage.Close(); err != nil {
+			slog.Warn("close storage", "error", err)
+		}
+	}()
 
 	checker := checker.New(prepareCheckerConfig(cfg))
 
@@ -36,16 +42,20 @@ func (a *App) Run(cfg config.Config) error {
 
 	api := api.New(service)
 
-	srv := server.New(prepareServerConfig(cfg), api)
+	srv := server.New(
+		prepareServerConfig(cfg),
+		logger.HTTPLogging(slog.Default(), api),
+	)
 
 	done := make(chan error)
 	go func() {
 		defer close(done)
+
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		s := <-c
-		_ = s
 
+		slog.Info("shutdown by signal", "signal", s)
 		if err := srv.Shutdown(); err != nil {
 			done <- err
 		}

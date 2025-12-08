@@ -3,11 +3,11 @@ package model
 import "slices"
 
 type Link struct {
-	Name       string
-	URL        string
-	Available  bool
-	StatusCode int
-	Reason     string
+	Name       string `json:"name,omitempty"`
+	URL        string `json:"url,omitempty"`
+	Available  bool   `json:"available,omitempty"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 func (l Link) Clone() Link {
@@ -19,8 +19,8 @@ func CloneLinks(ls []Link) []Link {
 }
 
 type LinkSet struct {
-	ID    uint64
-	Links []Link
+	ID    uint64 `json:"id,omitempty"`
+	Links []Link `json:"links,omitempty"`
 }
 
 func (ls LinkSet) Clone() LinkSet {

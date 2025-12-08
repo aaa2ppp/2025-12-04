@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -15,6 +16,7 @@ import (
 	"go.etcd.io/bbolt"
 	berrors "go.etcd.io/bbolt/errors"
 
+	"link-checker/internal/logger"
 	"link-checker/internal/model"
 	"link-checker/internal/service"
 )
@@ -119,6 +121,8 @@ func (s *Storage) generateID(b *bbolt.Bucket) (uint64, []byte, error) {
 }
 
 func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) {
+	const op = "Storage.Save"
+
 	linkSet := model.LinkSet{
 		Links: model.CloneLinks(links),
 	}
@@ -128,18 +132,21 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 
 		id, key, err := s.generateID(b)
 		if err != nil {
-			return fmt.Errorf("generate id: %w", err)
+			logger.FromContext(ctx).Error("generate id", "error", err, "op", op)
+			return model.ErrInternalError
 		}
 
 		linkSet.ID = id
 
 		data, err := json.Marshal(linkSet)
 		if err != nil {
-			return fmt.Errorf("marshal linkset: %w", err)
+			logger.FromContext(ctx).Error("marshal linkset", "error", err, "op", op)
+			return model.ErrInternalError
 		}
 
 		if err := b.Put(key, data); err != nil {
-			return fmt.Errorf("save to db: %w", err)
+			logger.FromContext(ctx).Error("database write", "error", err, "op", op)
+			return model.ErrInternalError
 		}
 
 		return nil
@@ -155,6 +162,8 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 }
 
 func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
+	const op = "Storage.Load"
+
 	if linkSet, ok := s.cache.get(id); ok {
 		return linkSet.Clone(), nil
 	}
@@ -166,17 +175,22 @@ func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
 		key := makeKey(id)
 		data = b.Get(key)
 		if data == nil {
-			return fmt.Errorf("linkset %d not found", id)
+			return fmt.Errorf("linkset %d: %w", id, model.ErrNotFound)
 		}
 		return nil
 	})
 	if err != nil {
-		return model.LinkSet{}, err
+		if errors.Is(err, model.ErrNotFound) {
+			return model.LinkSet{}, err
+		}
+		logger.FromContext(ctx).Error("database read", "error", err, "op", op, "link_set_id", id)
+		return model.LinkSet{}, model.ErrInternalError
 	}
 
 	var linkSet model.LinkSet
 	if err := json.Unmarshal(data, &linkSet); err != nil {
-		return model.LinkSet{}, fmt.Errorf("unmarshal linkset: %w", err)
+		logger.FromContext(ctx).Error("unmarshal linkset", "error", err, "op", op, "link_set_id", id)
+		return model.LinkSet{}, model.ErrInternalError
 	}
 
 	s.cache.set(id, &linkSet)
@@ -196,7 +210,7 @@ func (s *Storage) Close() error {
 		return nil
 	})
 	if err != nil && err != berrors.ErrDatabaseNotOpen {
-		slog.Error("storage: final sync transaction failed", "error", err)
+		slog.Warn("storage: final sync transaction failed", "error", err)
 	}
 
 	// db.Close ожидает завершения всех незавершенных транзакций (если такие есть).

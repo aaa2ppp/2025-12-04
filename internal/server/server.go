@@ -3,6 +3,7 @@ package server
 import (
 	"cmp"
 	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -98,6 +99,7 @@ func (s *Server) Serve(l net.Listener) error {
 
 // ListenAndServe обертка над [http.Server.ListenAndServe].
 func (s *Server) ListenAndServe() error {
+	slog.Info("server statup", "addr", s.server.Addr)
 	return s.server.ListenAndServe()
 }
 
