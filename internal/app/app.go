@@ -1,95 +1,90 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 
 	"link-checker/internal/api"
 	"link-checker/internal/checker"
 	"link-checker/internal/config"
 	"link-checker/internal/logger"
-	"link-checker/internal/report"
+	"link-checker/internal/report/pdf"
 	"link-checker/internal/server"
 	"link-checker/internal/service"
-	"link-checker/internal/storage"
+	"link-checker/internal/storage/bbolt"
 )
 
 type App struct {
 	// TODO
 }
 
-func (a *App) Run(cfg config.Config) error {
-	storage, err := storage.Open(prepareStorageConfig(cfg))
+func (a *App) Run(ctx context.Context, cfg config.Config) (anyErr error) {
+	logger.SetupDefault(cfg.Logger)
+
+	storage, err := bbolt.Open(prepareStorageConfig(cfg))
 	if err != nil {
 		return fmt.Errorf("open storage: %w", err)
 	}
 	defer func() {
 		if err := storage.Close(); err != nil {
-			slog.Warn("close storage", "error", err)
+			slog.Error("close storage", "error", err)
+			if anyErr == nil {
+				anyErr = fmt.Errorf("close storage: %w", err)
+			}
 		}
 	}()
 
 	checker := checker.New(prepareCheckerConfig(cfg))
 
-	builder := report.NewBuilder(prepareBuilderConfig(cfg))
+	builder := pdf.NewBuilder(prepareBuilderConfig(cfg))
 
 	service := service.New(storage, checker, builder)
 
-	api := api.New(service)
+	mux := http.NewServeMux()
+	mux.Handle("/api/", http.StripPrefix("/api", api.New(service)))
+	mux.Handle("/ping", http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "pong", http.StatusOK) }))
 
 	srv := server.New(
 		prepareServerConfig(cfg),
-		logger.HTTPLogging(slog.Default(), api),
+		logger.HTTPLogging(slog.Default(), mux),
 	)
 
-	done := make(chan error)
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-		s := <-c
-
-		slog.Info("shutdown by signal", "signal", s)
-		if err := srv.Shutdown(); err != nil {
-			done <- err
-		}
+		done <- srv.ListenAndServe()
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("server: %w", err)
-	}
-
-	if err := <-done; err != nil {
-		return fmt.Errorf("shutdown: %w", err)
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("server: %w", err)
+		}
+	case <-ctx.Done():
+		if err := srv.Shutdown(); err != nil {
+			return fmt.Errorf("shutdown: %w", err)
+		}
 	}
 
 	return nil
 }
 
-func prepareStorageConfig(cfg config.Config) storage.Config {
-	// TODO
-	return storage.Config{}
+func prepareStorageConfig(cfg config.Config) bbolt.Config {
+	return cfg.BBoltStor
 }
 
 func prepareCheckerConfig(cfg config.Config) checker.Config {
-	// TODO
-	return checker.Config{}
+	return cfg.Checker
 }
 
-func prepareBuilderConfig(cfg config.Config) report.Config {
+func prepareBuilderConfig(cfg config.Config) pdf.Config {
 	// TODO
-	return report.Config{}
+	return pdf.Config{}
 }
 
 func prepareServerConfig(cfg config.Config) server.Config {
-	// TODO
-	return server.Config{
-		Addr: "127.0.0.1:8080",
-	}
+	return cfg.Server
 }

@@ -12,7 +12,7 @@ import (
 	"syscall"
 
 	"link-checker/internal/model"
-	"link-checker/internal/report"
+	"link-checker/internal/report/pdf"
 )
 
 func main() {
@@ -47,7 +47,7 @@ func main() {
 	}
 
 	// Создаем билдер отчета
-	builder := report.NewBuilder(report.Config{})
+	builder := pdf.NewBuilder(pdf.Config{})
 
 	bw := bufio.NewWriter(os.Stdout)
 	defer bw.Flush()

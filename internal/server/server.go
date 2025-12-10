@@ -99,7 +99,7 @@ func (s *Server) Serve(l net.Listener) error {
 
 // ListenAndServe обертка над [http.Server.ListenAndServe].
 func (s *Server) ListenAndServe() error {
-	slog.Info("server statup", "addr", s.server.Addr)
+	slog.Info("server startup", "addr", s.server.Addr)
 	return s.server.ListenAndServe()
 }
 
@@ -144,6 +144,8 @@ func (s *Server) serverBusy(w http.ResponseWriter) {
 // Повторные вызовы возвращают [http.ErrServerClosed].
 // Всегда, в том числе при повторных вызовах, возвращается ПОСЛЕ остановки сервера.
 func (s *Server) Shutdown() error {
+	slog.Info("server shutting down", "timeout", s.shutdownTimeout)
+
 	s.shutdownMu.Lock()
 	defer s.shutdownMu.Unlock()
 
@@ -186,6 +188,7 @@ func (s *Server) waitTasks(ctx context.Context) {
 }
 
 func (s *Server) close() error {
+	slog.Debug("server send 'end immediately' to all task")
 	s.endImmediately()
 
 	ctx := context.Background()
@@ -195,5 +198,6 @@ func (s *Server) close() error {
 		ctx = controlShotCtx
 	}
 
+	slog.Debug("server close")
 	return s.server.Shutdown(ctx)
 }

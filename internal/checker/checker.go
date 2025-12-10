@@ -1,6 +1,7 @@
 package checker
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -15,19 +16,28 @@ import (
 )
 
 const (
-	DefaultTimeout = 10 * time.Second
+	DefaultUserAgent           = "LinkChecker/1.0"
+	DefaultTimeout             = 10 * time.Second
+	DefaultMaxIdleConns        = 100
+	DefaultMaxIdleConnsPerHost = 10
+	DefaultIdleConnTimeout     = 90 * time.Second
 )
 
 type Config struct {
-	Timeout       time.Duration
-	UserAgent     string
-	TryHTTPSFirst bool
-	// TryGETFallback bool // TODO
+	Timeout             time.Duration
+	UserAgent           string
+	TryHTTPSFirst       bool
+	TryGETFallback      bool // сейчас игнорируется, всегда false
+	MaxIdleConns        int
+	MaxIdleConnsPerHost int
+	IdleConnTimeout     time.Duration
 }
 
 type Checker struct {
-	client *http.Client
-	config Config
+	client         *http.Client
+	userAgent      string
+	tryHTTPSFirst  bool
+	tryGETFallback bool
 }
 
 func New(cfg Config) *Checker {
@@ -39,17 +49,19 @@ func New(cfg Config) *Checker {
 	}
 
 	client := &http.Client{
-		Timeout: cfg.Timeout,
+		Timeout: cmp.Or(cfg.Timeout, DefaultTimeout),
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:        cmp.Or(cfg.MaxIdleConns, DefaultMaxIdleConns),
+			MaxIdleConnsPerHost: cmp.Or(cfg.MaxIdleConnsPerHost, DefaultMaxIdleConns),
+			IdleConnTimeout:     cmp.Or(cfg.IdleConnTimeout, DefaultIdleConnTimeout),
 		},
 	}
 
 	return &Checker{
-		client: client,
-		config: cfg,
+		client:         client,
+		userAgent:      cmp.Or(cfg.UserAgent, DefaultUserAgent),
+		tryHTTPSFirst:  cfg.TryHTTPSFirst,
+		tryGETFallback: false, // TODO: должно быть cfg.TryGETFallback после реализации tryGET()
 	}
 }
 
@@ -57,8 +69,8 @@ func (c *Checker) Check(ctx context.Context, rawURLs []string) ([]model.Link, er
 	links := make([]model.Link, len(rawURLs))
 	var wg sync.WaitGroup
 
+	wg.Add(len(rawURLs))
 	for i, rawURL := range rawURLs {
-		wg.Add(1)
 		go func(i int, rawURL string) {
 			defer wg.Done()
 			links[i] = c.checkOne(ctx, rawURL)
@@ -86,6 +98,10 @@ func (c *Checker) checkOne(ctx context.Context, rawURL string) model.Link {
 	// Пробуем схемы по порядку
 	for _, url := range urlsToTry {
 		statusCode, err := c.tryHEAD(ctx, url)
+
+		if err == nil && statusCode == http.StatusMethodNotAllowed && c.tryGETFallback {
+			statusCode, err = c.tryGET(ctx, url)
+		}
 
 		if err != nil {
 			// Network error, context canceled, etc - смена схемы не поможет
@@ -140,7 +156,7 @@ func (c *Checker) prepareURLsToTry(raw string) ([]string, error) {
 	}
 
 	if u.Scheme == "" {
-		// XXX: если не добавит, то "google.com" -> {schema:"", host:"", path:"google.com"}
+		// XXX: если не добавить, то "google.com" -> {schema:"", host:"", path:"google.com"}
 		u, err = url.Parse("//" + raw)
 		if err != nil {
 			return nil, err
@@ -164,7 +180,7 @@ func (c *Checker) prepareURLsToTry(raw string) ([]string, error) {
 	u.Scheme = "https"
 	httpsURL := u.String()
 
-	if c.config.TryHTTPSFirst {
+	if c.tryHTTPSFirst {
 		return []string{httpsURL, httpURL}, nil
 	}
 	return []string{httpURL, httpsURL}, nil
@@ -176,7 +192,7 @@ func (c *Checker) tryHEAD(ctx context.Context, url string) (statusCode int, _ er
 		return 0, fmt.Errorf("create request: %w", err)
 	}
 
-	req.Header.Set("User-Agent", c.config.UserAgent)
+	req.Header.Set("User-Agent", c.userAgent)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -186,22 +202,17 @@ func (c *Checker) tryHEAD(ctx context.Context, url string) (statusCode int, _ er
 
 	statusCode = resp.StatusCode
 
-	// TODO: Handle 405 Method Not Allowed
-	// if statusCode == http.StatusMethodNotAllowed && c.config.TryGETFallback {
-	// 	return c.tryGET(ctx, url)
-	// }
-
 	return statusCode, nil
-}
-
-func (c *Checker) isAvailable(statusCode int) bool {
-	// TODO: уточнить условия доступности
-	return statusCode >= 200 && statusCode < 300
 }
 
 func (c *Checker) tryGET(ctx context.Context, url string) (int, error) {
 	// TODO
 	return 0, errors.New("tryGET: unimplimented")
+}
+
+func (c *Checker) isAvailable(statusCode int) bool {
+	// TODO: уточнить условия доступности
+	return statusCode >= 200 && statusCode < 300
 }
 
 var _ service.URLChecker = &Checker{}

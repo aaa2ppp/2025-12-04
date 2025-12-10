@@ -2,15 +2,20 @@ package service
 
 import (
 	"context"
-	"errors"
 
 	"link-checker/internal/api"
 	"link-checker/internal/model"
 )
 
+type LinkSetBatch struct {
+	LinkSets []model.LinkSet
+	Found    []bool
+}
+
 type LinkStorage interface {
 	Save(ctx context.Context, links []model.Link) (uint64, error)
 	Load(ctx context.Context, id uint64) (model.LinkSet, error)
+	LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, error)
 }
 
 type ReportBuilder interface {
@@ -53,23 +58,19 @@ func (s *Service) CheckLinks(ctx context.Context, rawLinks []string) (model.Link
 }
 
 func (s *Service) Report(ctx context.Context, linkSetIDs []uint64) (model.Report, error) {
-	linkSets := make([]model.LinkSet, 0, len(linkSetIDs))
+	batch, err := s.storage.LoadBatch(ctx, linkSetIDs)
+	if err != nil {
+		return model.Report{}, err
+	}
 
-	for _, id := range linkSetIDs {
-		linkSet, err := s.storage.Load(ctx, id)
-		if err != nil {
-			if errors.Is(err, model.ErrNotFound) {
-				linkSets = append(linkSets, model.LinkSet{
-					ID:    id,
-					Links: []model.Link{{Name: "unknown", Reason: err.Error()}}, // TODO: maybe add LinkSet.Err field?
-				})
-				continue
-			}
+	linkSets, found := batch.LinkSets, batch.Found
 
-			return model.Report{}, err
+	for i, id := range linkSetIDs {
+		if !found[i] {
+			linkSets[i].ID = id
+			// XXX чтобы в отчете хотя бы что-то говорилось о ненайденом linkset
+			linkSets[i].Links = []model.Link{{Name: "linkset not found"}}
 		}
-		
-		linkSets = append(linkSets, linkSet)
 	}
 
 	return s.builder.Build(ctx, linkSets)
