@@ -1,4 +1,4 @@
-package storage
+package bbolt
 
 import (
 	"container/list"
@@ -13,26 +13,29 @@ type cacheEntry struct {
 }
 
 type cache struct {
-	items map[uint64]*cacheEntry
-	lru   *list.List
-	mux   sync.RWMutex
-	size  int
-	max   int
+	items   map[uint64]*cacheEntry
+	lru     *list.List
+	mux     sync.RWMutex
+	size    int
+	maxSize int
 }
 
 func newCache(maxSize int) *cache {
-	if maxSize < 0 {
-		panic("NewCache: maxSize must be positive")
+	if maxSize <= 0 {
+		panic("newCache: maxSize must be positive")
 	}
 
 	return &cache{
-		items: make(map[uint64]*cacheEntry, maxSize),
-		lru:   list.New(),
-		max:   maxSize,
+		items:   make(map[uint64]*cacheEntry, maxSize),
+		lru:     list.New(),
+		maxSize: maxSize,
 	}
 }
 
 func (c *cache) get(id uint64) (*model.LinkSet, bool) {
+	if c == nil {
+		return nil, false
+	}
 	c.mux.RLock()
 	entry, ok := c.items[id]
 	c.mux.RUnlock()
@@ -50,6 +53,9 @@ func (c *cache) get(id uint64) (*model.LinkSet, bool) {
 }
 
 func (c *cache) set(id uint64, linkSet *model.LinkSet) {
+	if c == nil {
+		panic("cache.set on <nil>")
+	}
 	c.mux.Lock()
 	defer c.mux.Unlock()
 
@@ -61,7 +67,7 @@ func (c *cache) set(id uint64, linkSet *model.LinkSet) {
 	}
 
 	// Eviction если нужно
-	if c.size >= c.max && c.lru.Len() > 0 {
+	if c.size >= c.maxSize && c.lru.Len() > 0 {
 		oldest := c.lru.Back()
 		c.lru.Remove(oldest)
 		oldID := oldest.Value.(uint64)

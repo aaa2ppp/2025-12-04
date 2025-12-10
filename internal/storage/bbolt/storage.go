@@ -1,4 +1,4 @@
-package storage
+package bbolt
 
 import (
 	"cmp"
@@ -21,16 +21,8 @@ import (
 	"link-checker/internal/service"
 )
 
-type NoSyncMode int
-
 const (
-	NoSyncUndefined NoSyncMode = iota
-	NoSyncEnabled
-	NoSyncDisabled
-)
-
-const (
-	DefaultMaxCache = 1000
+	DefaultMaxCache = 10000
 	DefaultDataFile = "./data/linksets.db"
 	DefaultTimeout  = 1 * time.Second
 	DefaultNoSync   = true
@@ -39,46 +31,55 @@ const (
 var LinkSetBucket = []byte("linksets")
 
 type Config struct {
-	DataFile   string
-	MaxCache   int
-	Timeout    time.Duration
-	NoSyncMode NoSyncMode
+	DataFile string
+	MaxCache int
+	Timeout  time.Duration
+	NoSync   bool
+	Logger   *slog.Logger
+
+	MaxNotSyncedUpdates int
+	MaxSyncDelay        time.Duration
 }
 
 type Storage struct {
-	db    *bbolt.DB
-	cache *cache
+	db     *bbolt.DB
+	cache  *cache
+	syncer *syncer
+	logger *slog.Logger
 }
 
 func Open(cfg Config) (*Storage, error) {
 	maxCache := cmp.Or(cfg.MaxCache, DefaultMaxCache)
 	cache := newCache(maxCache)
 
+	logger := cmp.Or(cfg.Logger, slog.Default())
+
 	dataFile := cmp.Or(cfg.DataFile, DefaultDataFile)
+
 	dir := filepath.Dir(dataFile)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	var noSync bool
-	switch cfg.NoSyncMode {
-	case NoSyncUndefined:
-		noSync = DefaultNoSync
-	case NoSyncEnabled:
-		noSync = true
+	bops := &bbolt.Options{
+		Timeout: max(cmp.Or(cfg.Timeout, DefaultTimeout), 0),
+		NoSync:  cfg.NoSync,
 	}
 
-	timeout := cmp.Or(cfg.Timeout, DefaultTimeout)
-	if timeout < 0 {
-		timeout = 0
-	}
+	logger.Info("open database", "data_file", dataFile, "timeout", bops.Timeout, "no_sync", bops.NoSync,
+		"max_cache", cache.maxSize)
 
-	db, err := bbolt.Open(dataFile, 0600, &bbolt.Options{
-		Timeout: timeout,
-		NoSync:  noSync,
-	})
+	db, err := bbolt.Open(dataFile, 0600, bops)
 	if err != nil {
 		return nil, fmt.Errorf("open bolt db: %w", err)
+	}
+
+	var syncer *syncer
+	if cfg.NoSync {
+		syncer = newSyncer(db, logger, syncerConfig{
+			maxNotSyncedUpdates: cfg.MaxNotSyncedUpdates,
+			maxSyncDelay:        cfg.MaxSyncDelay,
+		})
 	}
 
 	err = db.Update(func(tx *bbolt.Tx) error {
@@ -91,8 +92,10 @@ func Open(cfg Config) (*Storage, error) {
 	}
 
 	return &Storage{
-		db:    db,
-		cache: cache,
+		db:     db,
+		cache:  cache,
+		syncer: syncer,
+		logger: logger,
 	}, nil
 }
 
@@ -132,7 +135,7 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 
 		id, key, err := s.generateID(b)
 		if err != nil {
-			logger.FromContext(ctx).Error("generate id", "error", err, "op", op)
+			logger.FromContextDef(ctx, s.logger).Error("generate id failed", "op", op, "error", err)
 			return model.ErrInternalError
 		}
 
@@ -140,13 +143,17 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 
 		data, err := json.Marshal(linkSet)
 		if err != nil {
-			logger.FromContext(ctx).Error("marshal linkset", "error", err, "op", op)
+			logger.FromContextDef(ctx, s.logger).Error("marshal linkset failed", "op", op, "error", err)
 			return model.ErrInternalError
 		}
 
 		if err := b.Put(key, data); err != nil {
-			logger.FromContext(ctx).Error("database write", "error", err, "op", op)
+			logger.FromContextDef(ctx, s.logger).Error("database write failed", "op", op, "error", err)
 			return model.ErrInternalError
+		}
+
+		if s.db.NoSync {
+			s.syncer.update()
 		}
 
 		return nil
@@ -168,6 +175,10 @@ func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
 		return linkSet.Clone(), nil
 	}
 
+	if err := ctx.Err(); err != nil {
+		return model.LinkSet{}, err
+	}
+
 	var data []byte
 	err := s.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(LinkSetBucket)
@@ -183,13 +194,13 @@ func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
 		if errors.Is(err, model.ErrNotFound) {
 			return model.LinkSet{}, err
 		}
-		logger.FromContext(ctx).Error("database read", "error", err, "op", op, "link_set_id", id)
+		logger.FromContextDef(ctx, s.logger).Error("database read failed", "op", op, "error", err, "link_set_id", id)
 		return model.LinkSet{}, model.ErrInternalError
 	}
 
 	var linkSet model.LinkSet
 	if err := json.Unmarshal(data, &linkSet); err != nil {
-		logger.FromContext(ctx).Error("unmarshal linkset", "error", err, "op", op, "link_set_id", id)
+		logger.FromContextDef(ctx, s.logger).Error("unmarshal linkset failed", "op", op, "error", err, "link_set_id", id)
 		return model.LinkSet{}, model.ErrInternalError
 	}
 
@@ -198,7 +209,82 @@ func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
 	return linkSet.Clone(), nil
 }
 
+type LinkSetBatch = service.LinkSetBatch
+
+func (s *Storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, error) {
+	const op = "Storage.LoadBatch"
+
+	linkSets := make([]model.LinkSet, len(ids))
+	found := make([]bool, len(ids))
+	foundCount := 0
+
+	for i, id := range ids {
+		if linkSet, ok := s.cache.get(id); ok {
+			linkSets[i] = linkSet.Clone()
+			found[i] = true
+			foundCount++
+		}
+
+	}
+
+	if foundCount == len(ids) {
+		return LinkSetBatch{LinkSets: linkSets, Found: found}, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return LinkSetBatch{}, err
+	}
+
+	var data []byte
+
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(LinkSetBucket)
+
+		for i, id := range ids {
+			if found[i] {
+				continue
+			}
+
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			key := makeKey(id)
+			data = b.Get(key)
+			if data == nil {
+				continue
+			}
+
+			if err := json.Unmarshal(data, &linkSets[i]); err != nil {
+				logger.FromContextDef(ctx, s.logger).Error("unmarshal linkset failed", "op", op, "error", err, "link_set_id", id)
+				return model.ErrInternalError
+			}
+
+			found[i] = true
+			foundCount++
+		}
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, model.ErrInternalError) {
+			return LinkSetBatch{}, err
+		}
+		logger.FromContextDef(ctx, s.logger).Error("database read failed", "op", op, "error", err)
+		return LinkSetBatch{}, model.ErrInternalError
+	}
+
+	return LinkSetBatch{LinkSets: linkSets, Found: found}, nil
+}
+
 func (s *Storage) Close() error {
+	const op = "Storage.Close"
+
+	s.logger.Info("close database")
+
+	if s.syncer != nil {
+		s.syncer.close()
+	}
 
 	// Гарантируем, что после выхода из Close все изменения будут сохранены на диске.
 	// После сброса флага NoSync последующие транзакции записи будут выполняться fdatasync.
@@ -210,7 +296,7 @@ func (s *Storage) Close() error {
 		return nil
 	})
 	if err != nil && err != berrors.ErrDatabaseNotOpen {
-		slog.Warn("storage: final sync transaction failed", "error", err)
+		s.logger.Warn("final sync transaction failed", "op", op, "error", err)
 	}
 
 	// db.Close ожидает завершения всех незавершенных транзакций (если такие есть).

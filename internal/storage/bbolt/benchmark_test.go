@@ -1,26 +1,31 @@
-package storage
+package bbolt
 
 import (
 	"context"
+	"log/slog"
 	"math/rand/v2"
 	"path/filepath"
 	"testing"
 
+	"link-checker/internal/logger"
 	"link-checker/internal/model"
 )
 
 func BenchmarkStorage_Save(b *testing.B) {
+	storLogger := slog.New(slog.DiscardHandler)
 	tmpFile := filepath.Join(b.TempDir(), "bench.db")
 	storage, err := Open(Config{
 		MaxCache: 1000,
 		DataFile: tmpFile,
+		NoSync:   true,
+		Logger:   storLogger,
 	})
 	if err != nil {
 		b.Fail()
 	}
 	defer storage.Close()
 
-	ctx := context.Background()
+	ctx := logger.Context(context.Background(), storLogger)
 
 	// Подготавливаем тестовые данные один раз
 	links := []model.Link{
@@ -40,17 +45,20 @@ func BenchmarkStorage_Save(b *testing.B) {
 }
 
 func BenchmarkStorage_ConcurrentSave(b *testing.B) {
+	storLogger := slog.New(slog.DiscardHandler)
 	tmpFile := filepath.Join(b.TempDir(), "bench.db")
 	storage, err := Open(Config{
 		MaxCache: 10000,
 		DataFile: tmpFile,
+		NoSync:   true,
+		Logger:   storLogger,
 	})
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer storage.Close()
 
-	ctx := context.Background()
+	ctx := logger.Context(context.Background(), storLogger)
 
 	links := []model.Link{
 		{Name: "Test Link 1", URL: "https://example.com/1"},
@@ -71,19 +79,22 @@ func BenchmarkStorage_ConcurrentSave(b *testing.B) {
 }
 
 func BenchmarkStorage_Load(b *testing.B) {
-	N := 1000
+	N := 10000
 
+	storLogger := slog.New(slog.DiscardHandler)
 	tmpFile := filepath.Join(b.TempDir(), "bench.db")
 	storage, err := Open(Config{
 		MaxCache: N / 33, // 3% попадания в кеш
 		DataFile: tmpFile,
+		NoSync:   true,
+		Logger:   storLogger,
 	})
 	if err != nil {
 		b.Fail()
 	}
 	defer storage.Close()
 
-	ctx := context.Background()
+	ctx := logger.Context(context.Background(), storLogger)
 
 	links := []model.Link{
 		{Name: "Test Link 1", URL: "https://example.com/1"},

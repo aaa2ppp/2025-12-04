@@ -1,24 +1,31 @@
-package storage
+package bbolt
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 
+	"link-checker/internal/logger"
 	"link-checker/internal/model"
 
 	"github.com/aaa2ppp/be"
 )
 
+func newTestLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
 func TestStorage_SaveLoad(t *testing.T) {
+	storLogger := newTestLogger()
 	tmpFile := filepath.Join(t.TempDir(), "test.db")
 	defer os.Remove(tmpFile)
 
-	ctx := context.Background()
+	ctx := logger.Context(context.Background(), storLogger)
 
-	storage1, err := Open(Config{MaxCache: 100, DataFile: tmpFile})
+	storage1, err := Open(Config{MaxCache: 100, DataFile: tmpFile, Logger: storLogger})
 	be.Err(t, err, nil)
 
 	links := []model.Link{
@@ -51,7 +58,7 @@ func TestStorage_SaveLoad(t *testing.T) {
 	err = storage1.Close()
 	be.Err(t, err, nil)
 
-	storage2, err := Open(Config{MaxCache: 100, DataFile: tmpFile})
+	storage2, err := Open(Config{MaxCache: 100, DataFile: tmpFile, Logger: storLogger})
 	be.Err(t, err, nil)
 	defer storage2.Close()
 
@@ -77,11 +84,12 @@ func TestStorage_SaveLoad(t *testing.T) {
 }
 
 func TestStorage_DataSafety(t *testing.T) {
+	storLogger := newTestLogger()
 	tmpFile := filepath.Join(t.TempDir(), "test.db")
 	defer os.Remove(tmpFile)
 
-	ctx := context.Background()
-	storage, err := Open(Config{MaxCache: 100, DataFile: tmpFile})
+	ctx := logger.Context(context.Background(), storLogger)
+	storage, err := Open(Config{MaxCache: 100, DataFile: tmpFile, Logger: storLogger})
 	be.Err(t, err, nil)
 	defer storage.Close()
 
@@ -111,11 +119,12 @@ func TestStorage_DataSafety(t *testing.T) {
 }
 
 func TestStorage_UniqueIDs(t *testing.T) {
+	storLogger := newTestLogger()
 	tmpFile := filepath.Join(t.TempDir(), "test.db")
 	defer os.Remove(tmpFile)
 
-	ctx := context.Background()
-	storage, err := Open(Config{MaxCache: 100, DataFile: tmpFile})
+	ctx := logger.Context(context.Background(), storLogger)
+	storage, err := Open(Config{MaxCache: 100, DataFile: tmpFile, Logger: storLogger})
 	be.Err(t, err, nil)
 	defer storage.Close()
 
@@ -152,10 +161,11 @@ func TestStorage_UniqueIDs(t *testing.T) {
 
 // Тест, чтобы запустить в дебаг режиме и убедится, что fdatasync гарантированно выполняется
 func TestStorage_Close(t *testing.T) {
+	storLogger := newTestLogger()
 	tmpFile := filepath.Join(t.TempDir(), "test.db")
 	defer os.Remove(tmpFile)
 
-	storage, err := Open(Config{MaxCache: 100, DataFile: tmpFile})
+	storage, err := Open(Config{MaxCache: 100, DataFile: tmpFile, Logger: storLogger})
 	be.Err(t, err, nil)
 	defer storage.Close()
 }
