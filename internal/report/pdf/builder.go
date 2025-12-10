@@ -131,9 +131,9 @@ func (b *Builder) addLinkSet(pdf *gofpdf.Fpdf, linkSet model.LinkSet) {
 	// Заголовки таблицы
 	pdf.CellFormat(10, 8, "#", "1", 0, "C", true, 0, "")
 	pdf.CellFormat(40, 8, "Name", "1", 0, "L", true, 0, "")
-	pdf.CellFormat(60, 8, "URL", "1", 0, "L", true, 0, "")
+	pdf.CellFormat(57, 8, "URL", "1", 0, "L", true, 0, "")
 	pdf.CellFormat(10, 8, "SC", "1", 0, "C", true, 0, "")
-	pdf.CellFormat(70, 8, "Reason", "1", 1, "C", true, 0, "")
+	pdf.CellFormat(73, 8, "Reason", "1", 1, "C", true, 0, "")
 
 	pdf.SetFont("Arial", "", 9)
 
@@ -147,9 +147,9 @@ func (b *Builder) addLinkSet(pdf *gofpdf.Fpdf, linkSet model.LinkSet) {
 
 			pdf.CellFormat(10, 8, "#", "1", 0, "C", true, 0, "")
 			pdf.CellFormat(40, 8, "Name", "1", 0, "L", true, 0, "")
-			pdf.CellFormat(60, 8, "URL", "1", 0, "L", true, 0, "")
+			pdf.CellFormat(57, 8, "URL", "1", 0, "L", true, 0, "")
 			pdf.CellFormat(10, 8, "SC", "1", 0, "C", true, 0, "")
-			pdf.CellFormat(70, 8, "Reason", "1", 1, "C", true, 0, "")
+			pdf.CellFormat(73, 8, "Reason", "1", 1, "C", true, 0, "")
 
 			pdf.SetFont("Arial", "", 9)
 		}
@@ -164,7 +164,7 @@ func (b *Builder) addLinkSet(pdf *gofpdf.Fpdf, linkSet model.LinkSet) {
 
 		pdf.CellFormat(10, 8, fmt.Sprintf("%d", i+1), "1", 0, "C", fill, 0, "")
 		pdf.CellFormat(40, 8, b.truncateString(link.Name, 20), "1", 0, "L", fill, 0, "")
-		pdf.CellFormat(60, 8, b.truncateString(link.URL, 30), "1", 0, "L", fill, 0, "")
+		pdf.CellFormat(57, 8, b.truncateString(link.URL, 30), "1", 0, "L", fill, 0, "")
 
 		// Код статуса
 		statusCode := fmt.Sprintf("%d", link.StatusCode)
@@ -177,12 +177,12 @@ func (b *Builder) addLinkSet(pdf *gofpdf.Fpdf, linkSet model.LinkSet) {
 			pdf.CellFormat(10, 8, statusCode, "1", 0, "C", fill, 0, "")
 			pdf.SetFont("Arial", "I", 8)
 			pdf.SetTextColor(150, 0, 0)
-			pdf.CellFormat(70, 8, b.truncateString(link.Reason, 45), "1", 1, "L", fill, 0, "")
+			pdf.CellFormat(73, 8, b.truncateString(link.Reason, 60), "1", 1, "L", fill, 0, "")
 			pdf.SetTextColor(0, 0, 0)
 			pdf.SetFont("Arial", "", 9)
 		} else {
 			pdf.CellFormat(10, 8, statusCode, "1", 0, "C", fill, 0, "")
-			pdf.CellFormat(70, 8, "", "1", 1, "L", fill, 0, "")
+			pdf.CellFormat(73, 8, "", "1", 1, "L", fill, 0, "")
 		}
 	}
 
