@@ -28,6 +28,8 @@ const (
 	DefaultNoSync   = true
 )
 
+var ErrTooManyIDCollisions = errors.New("too many ID collisions")
+
 var LinkSetBucket = []byte("linksets")
 
 type Config struct {
@@ -39,6 +41,9 @@ type Config struct {
 
 	MaxNotSyncedUpdates int
 	MaxSyncDelay        time.Duration
+
+	MaxSaveQueueSize int
+	MaxSaveDelay     time.Duration
 }
 
 type Storage struct {
@@ -46,6 +51,7 @@ type Storage struct {
 	cache  *cache
 	syncer *syncer
 	logger *slog.Logger
+	saver  *saver
 }
 
 func Open(cfg Config) (*Storage, error) {
@@ -75,10 +81,20 @@ func Open(cfg Config) (*Storage, error) {
 	}
 
 	var syncer *syncer
-	if cfg.NoSync {
+	if cfg.NoSync && cfg.MaxNotSyncedUpdates >= 0 && cfg.MaxSyncDelay >= 0 {
 		syncer = newSyncer(db, logger, syncerConfig{
 			maxNotSyncedUpdates: cfg.MaxNotSyncedUpdates,
 			maxSyncDelay:        cfg.MaxSyncDelay,
+		})
+	}
+
+	var saver *saver
+	if cfg.MaxSaveQueueSize >= 0 && cfg.MaxSaveDelay >= 0 {
+		saver = newSaver(db, logger, saverConfig{
+			cache:        cache,
+			syncer:       syncer,
+			maxQueueSize: cfg.MaxSaveQueueSize,
+			maxDelay:     cfg.MaxSaveDelay,
 		})
 	}
 
@@ -95,6 +111,7 @@ func Open(cfg Config) (*Storage, error) {
 		db:     db,
 		cache:  cache,
 		syncer: syncer,
+		saver:  saver,
 		logger: logger,
 	}, nil
 }
@@ -105,8 +122,8 @@ func makeKey(id uint64) []byte {
 	return key
 }
 
-func (s *Storage) generateID(b *bbolt.Bucket) (uint64, []byte, error) {
-	for range 10 {
+func generateID(b *bbolt.Bucket) (uint64, []byte, error) {
+	for range GenerateIDAttempts {
 		id := rand.Uint64()
 		if id == 0 {
 			continue
@@ -120,11 +137,15 @@ func (s *Storage) generateID(b *bbolt.Bucket) (uint64, []byte, error) {
 		return id, key, nil
 	}
 
-	return 0, nil, fmt.Errorf("too many ID collisions (10 attempts)")
+	return 0, nil, ErrTooManyIDCollisions
 }
 
 func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) {
 	const op = "Storage.Save"
+
+	if s.saver != nil {
+		return s.saver.Save(ctx, links)
+	}
 
 	linkSet := model.LinkSet{
 		Links: model.CloneLinks(links),
@@ -133,7 +154,7 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(LinkSetBucket)
 
-		id, key, err := s.generateID(b)
+		id, key, err := generateID(b)
 		if err != nil {
 			logger.FromContextDef(ctx, s.logger).Error("generate id failed", "op", op, "error", err)
 			return model.ErrInternalError
@@ -152,15 +173,15 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 			return model.ErrInternalError
 		}
 
-		if s.db.NoSync {
-			s.syncer.update()
-		}
-
 		return nil
 	})
 
 	if err != nil {
 		return 0, err
+	}
+
+	if s.syncer != nil {
+		s.syncer.Update()
 	}
 
 	s.cache.set(linkSet.ID, &linkSet)
@@ -171,7 +192,7 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
 	const op = "Storage.Load"
 
-	if linkSet, ok := s.cache.get(id); ok {
+	if linkSet := s.cache.Get(id); linkSet != nil {
 		return linkSet.Clone(), nil
 	}
 
@@ -204,7 +225,7 @@ func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
 		return model.LinkSet{}, model.ErrInternalError
 	}
 
-	s.cache.set(id, &linkSet)
+	s.cache.Set(&linkSet)
 
 	return linkSet.Clone(), nil
 }
@@ -219,7 +240,7 @@ func (s *Storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, er
 	foundCount := 0
 
 	for i, id := range ids {
-		if linkSet, ok := s.cache.get(id); ok {
+		if linkSet := s.cache.Get(id); linkSet != nil {
 			linkSets[i] = linkSet.Clone()
 			found[i] = true
 			foundCount++
@@ -282,8 +303,14 @@ func (s *Storage) Close() error {
 
 	s.logger.Info("close database")
 
+	if s.saver != nil {
+		if err := s.saver.Close(); err != nil {
+			s.logger.Warn("close saver failed", "op", op, "error", err)
+		}
+	}
+
 	if s.syncer != nil {
-		s.syncer.close()
+		s.syncer.Close()
 	}
 
 	// Гарантируем, что после выхода из Close все изменения будут сохранены на диске.

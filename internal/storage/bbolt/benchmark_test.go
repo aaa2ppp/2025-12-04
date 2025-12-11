@@ -12,35 +12,82 @@ import (
 )
 
 func BenchmarkStorage_Save(b *testing.B) {
+	// TODO: Тест нужно переделать. Сейчас мы замеряем время одного запроса.
+	// Но при saver:On мы задаем искуственную задержку по умолчанию 100ms.
+	// На вход надо подавать конкурентные запросы и мерить RPS.
+	
 	storLogger := slog.New(slog.DiscardHandler)
-	tmpFile := filepath.Join(b.TempDir(), "bench.db")
-	storage, err := Open(Config{
-		MaxCache: 1000,
-		DataFile: tmpFile,
-		NoSync:   true,
-		Logger:   storLogger,
-	})
-	if err != nil {
-		b.Fail()
+
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{
+			"NoSync:No syncer:No saver:No",
+			Config{
+				NoSync:       false,
+				MaxSyncDelay: -1,
+				MaxSaveDelay: -1,
+			},
+		},
+		{
+			"NoSync:Yes syncer:Disabled saver:Diasabled",
+			Config{
+				NoSync:       true,
+				MaxSyncDelay: -1,
+				MaxSaveDelay: -1,
+			},
+		},
+		{
+			"NoSync:Yes syncer:Yes saver:No",
+			Config{
+				NoSync:       true,
+				MaxSyncDelay: 0,
+				MaxSaveDelay: -1,
+			},
+		},
+		{
+			"NoSync:No syncer:No saver:Yes",
+			Config{
+				NoSync:       false,
+				MaxSyncDelay: -1,
+				MaxSaveDelay: 0,
+			},
+		},
+		// TODO
 	}
-	defer storage.Close()
 
-	ctx := logger.Context(context.Background(), storLogger)
+	for _, tt := range tests {
+		b.Run(tt.name, func(b *testing.B) {
+			tmpFile := filepath.Join(b.TempDir(), "bench.db")
 
-	// Подготавливаем тестовые данные один раз
-	links := []model.Link{
-		{Name: "Test Link 1", URL: "https://example.com/1"},
-		{Name: "Test Link 2", URL: "https://example.com/2"},
-		{Name: "Test Link 3", URL: "https://example.com/3"},
-	}
+			tt.cfg.DataFile = tmpFile
+			tt.cfg.Logger = storLogger
 
-	b.ResetTimer()
+			storage, err := Open(tt.cfg)
+			if err != nil {
+				b.Fail()
+			}
+			defer storage.Close()
 
-	for i := 0; i < b.N; i++ {
-		_, err := storage.Save(ctx, links)
-		if err != nil {
-			b.Fatal(err)
-		}
+			ctx := logger.Context(context.Background(), storLogger)
+
+			// Подготавливаем тестовые данные один раз
+			links := []model.Link{
+				{Name: "Test Link 1", URL: "https://example.com/1"},
+				{Name: "Test Link 2", URL: "https://example.com/2"},
+				{Name: "Test Link 3", URL: "https://example.com/3"},
+			}
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				_, err := storage.Save(ctx, links)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

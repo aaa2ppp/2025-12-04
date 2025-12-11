@@ -16,7 +16,7 @@ BINARIES := $(patsubst cmd/%,$(BIN_DIR)/%,$(CMDS))
 
 
 MERGE_FILES ?= Makefile go.mod go.sum *.go *.sh *.md *.example
-MERGE_EXCLUDE_DIRS ?= .* tmp bak bak[0-9] bin data idea
+MERGE_EXCLUDE_DIRS ?= .* tmp bak bak[0-9] bin data idea achiev
 
 MERGE_FIND_PARTS   := $(patsubst %,-o -name '%',$(MERGE_FILES))
 MERGE_FIND_EXPR    := $(wordlist 2,$(words $(MERGE_FIND_PARTS)),$(MERGE_FIND_PARTS))

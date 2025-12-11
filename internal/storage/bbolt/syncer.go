@@ -51,13 +51,15 @@ func newSyncer(db *bbolt.DB, logger *slog.Logger, cfg syncerConfig) *syncer {
 	return s
 }
 
-func (s *syncer) close() {
+// Close прекращает работу синхронизатора. Ничего не делает, если рессивер nil или синхронизатор уже закрыт.
+func (s *syncer) Close() {
 	if s != nil {
 		close(s.closeCh)
 	}
 }
 
-func (s *syncer) update() {
+// Update сообщает синхронизатору, что было обновление. Ничего не делает, если ресивер nil или синхронизатор уже закрыт.
+func (s *syncer) Update() {
 	if s != nil {
 		select {
 		case s.updateCh <- struct{}{}:
