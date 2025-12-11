@@ -4,6 +4,7 @@
 .out
 .bin
 .pprof
+todo.*
 .*/
 tmp/
 bin/
@@ -12,3 +13,4 @@ bak[0-9]/
 data/
 idea/
 todo/
+achiev/

@@ -15,7 +15,7 @@ type cacheEntry struct {
 type cache struct {
 	items   map[uint64]*cacheEntry
 	lru     *list.List
-	mux     sync.RWMutex
+	mux     sync.Mutex
 	size    int
 	maxSize int
 }
@@ -32,27 +32,23 @@ func newCache(maxSize int) *cache {
 	}
 }
 
-func (c *cache) get(id uint64) (*model.LinkSet, bool) {
+func (c *cache) Get(id uint64) (*model.LinkSet, bool) {
 	if c == nil {
 		return nil, false
 	}
-	c.mux.RLock()
-	entry, ok := c.items[id]
-	c.mux.RUnlock()
 
-	if !ok {
-		return nil, false
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	if entry, ok := c.items[id]; ok {
+		c.lru.MoveToFront(entry.elem)
+		return entry.linkSet, true
 	}
 
-	// Обновляем LRU (требует полной блокировки)
-	c.mux.Lock()
-	c.lru.MoveToFront(entry.elem)
-	c.mux.Unlock()
-
-	return entry.linkSet, true
+	return nil, false
 }
 
-func (c *cache) set(id uint64, linkSet *model.LinkSet) {
+func (c *cache) Set(id uint64, linkSet *model.LinkSet) {
 	if c == nil {
 		panic("cache.set on <nil>")
 	}

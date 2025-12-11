@@ -40,7 +40,7 @@ func TestStorage_SaveLoad(t *testing.T) {
 
 	{
 		// Проверяем, что попало в кеш
-		linkSetPtr, ok := storage1.cache.get(id)
+		linkSetPtr, ok := storage1.cache.Get(id)
 		be.True(t, linkSetPtr != nil)
 		be.True(t, ok)
 		if linkSetPtr != nil {
@@ -70,7 +70,7 @@ func TestStorage_SaveLoad(t *testing.T) {
 		be.Equal(t, linkSet.Links, links)
 
 		// Проверяем, что попало в кеш
-		linkSetPtr, ok := storage2.cache.get(id)
+		linkSetPtr, ok := storage2.cache.Get(id)
 		be.True(t, linkSetPtr != nil)
 		be.True(t, ok)
 		if linkSetPtr != nil {

@@ -51,13 +51,13 @@ func newSyncer(db *bbolt.DB, logger *slog.Logger, cfg syncerConfig) *syncer {
 	return s
 }
 
-func (s *syncer) close() {
+func (s *syncer) Close() {
 	if s != nil {
 		close(s.closeCh)
 	}
 }
 
-func (s *syncer) update() {
+func (s *syncer) Update() {
 	if s != nil {
 		select {
 		case s.updateCh <- struct{}{}:

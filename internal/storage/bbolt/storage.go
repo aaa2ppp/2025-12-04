@@ -28,6 +28,10 @@ const (
 	DefaultNoSync   = true
 )
 
+const generateIDAttempts = 10
+
+var ErrTooManyIDCollisions = errors.New("too many ID collisions")
+
 var LinkSetBucket = []byte("linksets")
 
 type Config struct {
@@ -106,7 +110,7 @@ func makeKey(id uint64) []byte {
 }
 
 func (s *Storage) generateID(b *bbolt.Bucket) (uint64, []byte, error) {
-	for range 10 {
+	for range generateIDAttempts {
 		id := rand.Uint64()
 		if id == 0 {
 			continue
@@ -120,7 +124,7 @@ func (s *Storage) generateID(b *bbolt.Bucket) (uint64, []byte, error) {
 		return id, key, nil
 	}
 
-	return 0, nil, fmt.Errorf("too many ID collisions (10 attempts)")
+	return 0, nil, ErrTooManyIDCollisions
 }
 
 func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) {
@@ -152,10 +156,6 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 			return model.ErrInternalError
 		}
 
-		if s.db.NoSync {
-			s.syncer.update()
-		}
-
 		return nil
 	})
 
@@ -163,7 +163,13 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 		return 0, err
 	}
 
-	s.cache.set(linkSet.ID, &linkSet)
+	if s.db.NoSync {
+		s.syncer.Update()
+	}
+
+	if s.cache != nil {
+		s.cache.Set(linkSet.ID, &linkSet)
+	}
 
 	return linkSet.ID, nil
 }
@@ -171,7 +177,7 @@ func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
 	const op = "Storage.Load"
 
-	if linkSet, ok := s.cache.get(id); ok {
+	if linkSet, ok := s.cache.Get(id); ok {
 		return linkSet.Clone(), nil
 	}
 
@@ -204,7 +210,7 @@ func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
 		return model.LinkSet{}, model.ErrInternalError
 	}
 
-	s.cache.set(id, &linkSet)
+	s.cache.Set(id, &linkSet)
 
 	return linkSet.Clone(), nil
 }
@@ -219,7 +225,7 @@ func (s *Storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, er
 	foundCount := 0
 
 	for i, id := range ids {
-		if linkSet, ok := s.cache.get(id); ok {
+		if linkSet, ok := s.cache.Get(id); ok {
 			linkSets[i] = linkSet.Clone()
 			found[i] = true
 			foundCount++
@@ -283,7 +289,7 @@ func (s *Storage) Close() error {
 	s.logger.Info("close database")
 
 	if s.syncer != nil {
-		s.syncer.close()
+		s.syncer.Close()
 	}
 
 	// Гарантируем, что после выхода из Close все изменения будут сохранены на диске.
