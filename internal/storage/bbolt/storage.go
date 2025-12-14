@@ -28,6 +28,8 @@ const (
 	DefaultNoSync   = true
 )
 
+const generateIDAttempts = 10
+
 var ErrTooManyIDCollisions = errors.New("too many ID collisions")
 
 var LinkSetBucket = []byte("linksets")
@@ -44,21 +46,24 @@ type Config struct {
 
 	MaxSaveQueueSize int
 	MaxSaveDelay     time.Duration
+
+	CheckIDCollisions bool
 }
 
 type Storage struct {
-	db     *bbolt.DB
-	cache  *cache
-	syncer *syncer
-	logger *slog.Logger
-	saver  *saver
+	db *bbolt.DB
+	*storage
+	pending *pendingSaver
 }
 
 func Open(cfg Config) (*Storage, error) {
-	maxCache := cmp.Or(cfg.MaxCache, DefaultMaxCache)
-	cache := newCache(maxCache)
-
 	logger := cmp.Or(cfg.Logger, slog.Default())
+
+	var cache *cache
+	if cfg.MaxCache >= 0 {
+		maxCache := cmp.Or(cfg.MaxCache, DefaultMaxCache)
+		cache = newCache(maxCache)
+	}
 
 	dataFile := cmp.Or(cfg.DataFile, DefaultDataFile)
 
@@ -72,29 +77,33 @@ func Open(cfg Config) (*Storage, error) {
 		NoSync:  cfg.NoSync,
 	}
 
-	logger.Info("open database", "data_file", dataFile, "timeout", bops.Timeout, "no_sync", bops.NoSync,
-		"max_cache", cache.maxSize)
+	logger.Info("open database", "data_file", dataFile, "timeout", bops.Timeout, "no_sync", bops.NoSync)
 
 	db, err := bbolt.Open(dataFile, 0600, bops)
 	if err != nil {
 		return nil, fmt.Errorf("open bolt db: %w", err)
 	}
 
-	var syncer *syncer
+	var syncer *periodicSyncer
 	if cfg.NoSync && cfg.MaxNotSyncedUpdates >= 0 && cfg.MaxSyncDelay >= 0 {
-		syncer = newSyncer(db, logger, syncerConfig{
+		syncer = newSyncer(bboltDB{db}, logger, syncerConfig{
 			maxNotSyncedUpdates: cfg.MaxNotSyncedUpdates,
 			maxSyncDelay:        cfg.MaxSyncDelay,
 		})
 	}
 
-	var saver *saver
+	storage := &storage{
+		db:     bboltDB{db},
+		cache:  cache,
+		syncer: syncer,
+		logger: logger,
+	}
+
+	var pending *pendingSaver
 	if cfg.MaxSaveQueueSize >= 0 && cfg.MaxSaveDelay >= 0 {
-		saver = newSaver(db, logger, saverConfig{
-			cache:        cache,
-			syncer:       syncer,
-			maxQueueSize: cfg.MaxSaveQueueSize,
-			maxDelay:     cfg.MaxSaveDelay,
+		pending = newPendingSaver(storage.SaveBatch, pendingSaverConfig{
+			QueueSize: cfg.MaxSaveQueueSize,
+			Delay:     cfg.MaxSaveDelay,
 		})
 	}
 
@@ -108,11 +117,9 @@ func Open(cfg Config) (*Storage, error) {
 	}
 
 	return &Storage{
-		db:     db,
-		cache:  cache,
-		syncer: syncer,
-		saver:  saver,
-		logger: logger,
+		db:      db,
+		storage: storage,
+		pending: pending,
 	}, nil
 }
 
@@ -122,15 +129,15 @@ func makeKey(id uint64) []byte {
 	return key
 }
 
-func generateID(b *bbolt.Bucket) (uint64, []byte, error) {
-	for range GenerateIDAttempts {
+func generateID(b Bucket) (uint64, []byte, error) {
+	for range generateIDAttempts {
 		id := rand.Uint64()
 		if id == 0 {
 			continue
 		}
 
 		key := makeKey(id)
-		if b.Get(key) != nil {
+		if b != nil && b.Get(key) != nil {
 			continue
 		}
 
@@ -141,98 +148,145 @@ func generateID(b *bbolt.Bucket) (uint64, []byte, error) {
 }
 
 func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) {
-	const op = "Storage.Save"
+	if s.pending != nil {
+		return s.pending.Save(ctx, links)
+	}
+	return s.storage.Save(ctx, links)
+}
 
+func (s *Storage) Close() error {
+	const op = "Storage.Close"
+
+	s.logger.Info("close database")
+
+	if s.saver != nil {
+		if err := s.saver.Close(); err != nil {
+			s.logger.Warn("close saver failed", "op", op, "error", err)
+		}
+	}
+
+	if s.syncer != nil {
+		s.syncer.Close()
+	}
+
+	if s.db.NoSync {
+		// Гарантируем, что после выхода из Close все изменения будут сохранены на диске.
+		// После сброса флага NoSync последующие транзакции записи будут выполняться fdatasync.
+		s.db.NoSync = false
+
+		// Гарантируем, что после сброса флага NoSync будет по крайней мере одна транзакция записи,
+		// котрая выполнит fdatasync.
+		err := s.db.Update(func(tx *bbolt.Tx) error { return nil })
+		if err != nil && err != berrors.ErrDatabaseNotOpen {
+			s.logger.Warn("final sync transaction failed", "op", op, "error", err)
+		}
+	}
+
+	// db.Close ожидает завершения всех незавершенных транзакций (если такие есть).
+	// В bbolt одновременно может существовать только одна транзакция записи.
+	// Это означает, что транзакции записи, которые ожидает db.Close, выполняются после
+	// нашей пустой транзакции и, следовательно, после сброса флага NoSync и будут
+	// выполнять fdatasync.
+	return s.db.Close()
+}
+
+type storage struct {
+	db     DB
+	cache  *cache
+	syncer *periodicSyncer
+	saver  *pendingSaver
+	logger *slog.Logger
+}
+
+func (s *storage) Save(ctx context.Context, links []model.Link) (uint64, error) {
 	if s.saver != nil {
 		return s.saver.Save(ctx, links)
 	}
 
-	linkSet := model.LinkSet{
-		Links: model.CloneLinks(links),
+	resp, err := s.SaveBatch(ctx, [][]model.Link{links})
+	if err != nil {
+		return 0, err
+	}
+	return resp[0], nil
+}
+
+func (s *storage) SaveBatch(ctx context.Context, links [][]model.Link) ([]uint64, error) {
+	const op = "Storage.SaveBatch"
+
+	if len(links) == 0 {
+		return nil, nil
 	}
 
-	err := s.db.Update(func(tx *bbolt.Tx) error {
+	// Сюда соберем сгенерированные IDs для новых записей
+	ids := make([]uint64, len(links))
+
+	// Сохраняем пачку запрос в базу одной транзакцией
+	err := s.db.Update(func(tx Tx) error {
 		b := tx.Bucket(LinkSetBucket)
 
-		id, key, err := generateID(b)
-		if err != nil {
-			logger.FromContextDef(ctx, s.logger).Error("generate id failed", "op", op, "error", err)
-			return model.ErrInternalError
-		}
+		for i := range links {
+			id, key, err := generateID(b)
+			if err != nil {
+				s.logger.Error("generate id failed", "op", op, "error", err)
+				return model.ErrInternalError
+			}
 
-		linkSet.ID = id
+			ids[i] = id
 
-		data, err := json.Marshal(linkSet)
-		if err != nil {
-			logger.FromContextDef(ctx, s.logger).Error("marshal linkset failed", "op", op, "error", err)
-			return model.ErrInternalError
-		}
+			linkSet := model.LinkSet{
+				ID:    id,
+				Links: links[i],
+			}
 
-		if err := b.Put(key, data); err != nil {
-			logger.FromContextDef(ctx, s.logger).Error("database write failed", "op", op, "error", err)
-			return model.ErrInternalError
+			data, err := json.Marshal(linkSet)
+			if err != nil {
+				s.logger.Error("marshal linkset failed", "op", op, "error", err)
+				return model.ErrInternalError
+			}
+
+			if err := b.Put(key, data); err != nil {
+				s.logger.Error("database write failed", "op", op, "error", err)
+				return model.ErrInternalError
+			}
 		}
 
 		return nil
 	})
 
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	if s.syncer != nil {
 		s.syncer.Update()
 	}
 
-	s.cache.set(linkSet.ID, &linkSet)
-
-	return linkSet.ID, nil
-}
-
-func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
-	const op = "Storage.Load"
-
-	if linkSet := s.cache.Get(id); linkSet != nil {
-		return linkSet.Clone(), nil
+	if s.cache != nil {
+		s.cache.Do(func(c lockedCache) {
+			for i := range links {
+				linkSet := &model.LinkSet{
+					ID:    ids[i],
+					Links: model.CloneLinks(links[i]),
+				}
+				c.Put(linkSet)
+			}
+		})
 	}
 
-	if err := ctx.Err(); err != nil {
-		return model.LinkSet{}, err
-	}
-
-	var data []byte
-	err := s.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(LinkSetBucket)
-
-		key := makeKey(id)
-		data = b.Get(key)
-		if data == nil {
-			return fmt.Errorf("linkset %d: %w", id, model.ErrNotFound)
-		}
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, model.ErrNotFound) {
-			return model.LinkSet{}, err
-		}
-		logger.FromContextDef(ctx, s.logger).Error("database read failed", "op", op, "error", err, "link_set_id", id)
-		return model.LinkSet{}, model.ErrInternalError
-	}
-
-	var linkSet model.LinkSet
-	if err := json.Unmarshal(data, &linkSet); err != nil {
-		logger.FromContextDef(ctx, s.logger).Error("unmarshal linkset failed", "op", op, "error", err, "link_set_id", id)
-		return model.LinkSet{}, model.ErrInternalError
-	}
-
-	s.cache.Set(&linkSet)
-
-	return linkSet.Clone(), nil
+	return ids, nil
 }
 
 type LinkSetBatch = service.LinkSetBatch
 
-func (s *Storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, error) {
+func (s *storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
+	resp, err := s.LoadBatch(ctx, []uint64{id})
+	if err != nil {
+		return model.LinkSet{}, err
+	}
+	return resp.LinkSets[0], nil
+}
+
+func (s *storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, error) {
 	const op = "Storage.LoadBatch"
 
 	linkSets := make([]model.LinkSet, len(ids))
@@ -258,7 +312,7 @@ func (s *Storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, er
 
 	var data []byte
 
-	err := s.db.View(func(tx *bbolt.Tx) error {
+	err := s.db.View(func(tx Tx) error {
 		b := tx.Bucket(LinkSetBucket)
 
 		for i, id := range ids {
@@ -281,6 +335,11 @@ func (s *Storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, er
 				return model.ErrInternalError
 			}
 
+			if s.cache != nil {
+				cloned := linkSets[i].Clone()
+				s.cache.Put(&cloned)
+			}
+
 			found[i] = true
 			foundCount++
 		}
@@ -296,42 +355,6 @@ func (s *Storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, er
 	}
 
 	return LinkSetBatch{LinkSets: linkSets, Found: found}, nil
-}
-
-func (s *Storage) Close() error {
-	const op = "Storage.Close"
-
-	s.logger.Info("close database")
-
-	if s.saver != nil {
-		if err := s.saver.Close(); err != nil {
-			s.logger.Warn("close saver failed", "op", op, "error", err)
-		}
-	}
-
-	if s.syncer != nil {
-		s.syncer.Close()
-	}
-
-	// Гарантируем, что после выхода из Close все изменения будут сохранены на диске.
-	// После сброса флага NoSync последующие транзакции записи будут выполняться fdatasync.
-	s.db.NoSync = false
-
-	// Гарантируем, что после сброса флага NoSync будет по крайней мере одна транзакция записи,
-	// котрая выполнит fdatasync.
-	err := s.db.Update(func(tx *bbolt.Tx) error {
-		return nil
-	})
-	if err != nil && err != berrors.ErrDatabaseNotOpen {
-		s.logger.Warn("final sync transaction failed", "op", op, "error", err)
-	}
-
-	// db.Close ожидает завершения всех незавершенных транзакций (если такие есть).
-	// В bbolt одновременно может существовать только одна транзакция записи.
-	// Это означает, что транзакции записи, которые ожидает db.Close, выполняются после
-	// нашей пустой транзакции и, следовательно, после сброса флага NoSync и будут
-	// выполнять fdatasync.
-	return s.db.Close()
 }
 
 var _ service.LinkStorage = &Storage{}

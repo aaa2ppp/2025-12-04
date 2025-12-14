@@ -4,9 +4,8 @@ import (
 	"cmp"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
-
-	"go.etcd.io/bbolt"
 )
 
 const (
@@ -21,22 +20,27 @@ type syncerConfig struct {
 	syncErrorLogPeriod  time.Duration
 }
 
-type syncer struct {
-	db                  *bbolt.DB
+type Syncer interface {
+	Sync() error
+}
+
+type periodicSyncer struct {
+	db                  Syncer
 	logger              *slog.Logger
 	maxNotSyncedUpdates int
 	maxSyncDelay        time.Duration
 	syncErrorLogPeriod  time.Duration
 	lastErrorLog        time.Time
-	closeCh             chan struct{}
 	updateCh            chan struct{}
+	closeMu             sync.Mutex
+	closeCh             chan struct{}
 }
 
-func newSyncer(db *bbolt.DB, logger *slog.Logger, cfg syncerConfig) *syncer {
+func newSyncer(db Syncer, logger *slog.Logger, cfg syncerConfig) *periodicSyncer {
 	if db == nil {
 		panic("newSyncer: db cannot be nil")
 	}
-	s := &syncer{
+	s := &periodicSyncer{
 		db:     db,
 		logger: logger,
 
@@ -52,62 +56,66 @@ func newSyncer(db *bbolt.DB, logger *slog.Logger, cfg syncerConfig) *syncer {
 }
 
 // Close прекращает работу синхронизатора. Ничего не делает, если рессивер nil или синхронизатор уже закрыт.
-func (s *syncer) Close() {
-	if s != nil {
+func (s *periodicSyncer) Close() {
+	if s == nil {
+		return
+	}
+
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+
+	select {
+	case <-s.closeCh:
+	default:
 		close(s.closeCh)
 	}
 }
 
 // Update сообщает синхронизатору, что было обновление. Ничего не делает, если ресивер nil или синхронизатор уже закрыт.
-func (s *syncer) Update() {
-	if s != nil {
-		select {
-		case s.updateCh <- struct{}{}:
-		case <-s.closeCh:
-			// syncer закрыт, игнорируем
-		}
+func (s *periodicSyncer) Update() {
+	if s == nil {
+		return
+	}
+
+	select {
+	case <-s.closeCh:
+	case s.updateCh <- struct{}{}:
 	}
 }
 
-func (s *syncer) serve() {
-	tm := time.NewTimer(time.Duration(math.MaxInt))
+func (s *periodicSyncer) serve() {
+	tm := time.NewTimer(math.MaxInt64)
 	tm.Stop()
-	var c <-chan time.Time
-	var count int
-
 	defer tm.Stop()
+
+	var (
+		count int
+	)
 
 	for {
 		select {
 		case <-s.closeCh:
 			return
 
-		case <-c:
-			// Таймер сработал
-			c = nil   // инвариант: остановка -> c = nil
-			count = 0 // инвариант: синхронизация -> count = 0
+		case <-tm.C:
 			s.sync()
+			count = 0
 
 		case <-s.updateCh:
 			count = (count + 1) % s.maxNotSyncedUpdates
 			switch count {
 			case 0:
-				// Ручная остановка (достигли лимита обновлений)
 				tm.Stop()
-				c = nil   // инвариант: остановка -> c = nil
-				count = 0 // уже 0, но для ясности
 				s.sync()
 
 			case 1:
-				// Запускаем таймер отложенной синхронизации
 				tm.Reset(s.maxSyncDelay)
-				c = tm.C // инвариант: запуск -> c = tm.C
 			}
 		}
 	}
 }
 
-func (s *syncer) sync() {
+func (s *periodicSyncer) sync() {
 	if err := s.db.Sync(); err != nil {
 		if s.logger == nil {
 			return

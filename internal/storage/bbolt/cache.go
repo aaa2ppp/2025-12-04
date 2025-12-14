@@ -25,9 +25,12 @@ func newCache(maxSize int) *cache {
 		panic("newCache: maxSize must be positive")
 	}
 
+	items := make(map[uint64]cacheEntry, maxSize)
+	lru := list.New()
+
 	return &cache{
-		items:   make(map[uint64]cacheEntry, maxSize),
-		lru:     list.New(),
+		items:   items,
+		lru:     lru,
 		maxSize: maxSize,
 	}
 }
@@ -42,18 +45,21 @@ func (c *cache) Get(id uint64) *model.LinkSet {
 	c.mux.Lock()
 	defer c.mux.Unlock()
 
+	return c.get(id)
+}
+
+func (c *cache) get(id uint64) *model.LinkSet {
 	if entry, ok := c.items[id]; ok {
 		c.lru.MoveToFront(entry.elem)
 		return entry.linkSet
 	}
-
 	return nil
 }
 
-// Set обновляет/добавляет запись в кэше. Паникует если ресивер nil.
+// Put обновляет/добавляет запись в кэше. Паникует если ресивер nil.
 // Поднимает приоритет записи в кэше.
 // При необходимости удаляет низкоприоритетные записи.
-func (c *cache) Set(linkSet *model.LinkSet) {
+func (c *cache) Put(linkSet *model.LinkSet) {
 	if c == nil {
 		panic("cache.Set on <nil>")
 	}
@@ -67,26 +73,25 @@ func (c *cache) Set(linkSet *model.LinkSet) {
 func (c *cache) set(id uint64, linkSet *model.LinkSet) {
 	var elem *list.Element
 
-	if empty, ok := c.items[id]; ok {
-		elem = empty.elem
+	if entry, ok := c.items[id]; ok {
+		elem = entry.elem
 		c.lru.MoveToFront(elem)
 	} else {
+		if c.size >= c.maxSize { // конструктор гарантирует, maxSize > 0
+			oldest := c.lru.Back()
+			c.lru.Remove(oldest)
+			oldID := oldest.Value.(uint64)
+			delete(c.items, oldID)
+			c.size--
+		}
 		elem = c.lru.PushFront(id)
-	}
-
-	for c.size >= c.maxSize && c.lru.Len() > 0 {
-		oldest := c.lru.Back()
-		c.lru.Remove(oldest)
-		oldID := oldest.Value.(uint64)
-		delete(c.items, oldID)
-		c.size--
+		c.size++
 	}
 
 	c.items[id] = cacheEntry{
 		linkSet: linkSet,
 		elem:    elem,
 	}
-	c.size++
 }
 
 type lockedCache struct {
@@ -99,14 +104,10 @@ func (u lockedCache) Contains(id uint64) bool {
 }
 
 func (u lockedCache) Get(id uint64) *model.LinkSet {
-	if entry, ok := u.cache.items[id]; ok {
-		u.cache.lru.MoveToFront(entry.elem)
-		return entry.linkSet
-	}
-	return nil
+	return u.cache.get(id)
 }
 
-func (u lockedCache) Set(linkSet *model.LinkSet) {
+func (u lockedCache) Put(linkSet *model.LinkSet) {
 	u.cache.set(linkSet.ID, linkSet)
 }
 
