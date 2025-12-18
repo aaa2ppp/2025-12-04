@@ -3,53 +3,72 @@ package bbolt
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"link-checker/internal/model"
 
 	"github.com/aaa2ppp/be"
+	"golang.org/x/sync/errgroup"
 )
 
-type testBatchSaver struct {
-	count int
+type stubBatchSaver struct{}
+
+func (bs stubBatchSaver) saveBatch(batch [][]model.Link) ([]uint64, error) {
+	return nil, nil
 }
 
-func (bs *testBatchSaver) saveBatch(ctx context.Context, batch [][]model.Link) ([]uint64, error) {
-	ids := make([]uint64, len(batch))
-	for range batch {
-		bs.count++
-		ids = append(ids, uint64(bs.count))
+type fakeBatchSaver struct {
+	data  [][]model.Link
+	calls int
+}
+
+func (bs *fakeBatchSaver) saveBatch(batch [][]model.Link) ([]uint64, error) {
+	bs.calls++
+	ids := make([]uint64, 0, len(batch))
+	for _, links := range batch {
+		bs.data = append(bs.data, links)
+		ids = append(ids, uint64(len(bs.data)))
 	}
 	return ids, nil
 }
 
+type mockBatchSaver struct {
+	saveBatchFunc func(batch [][]model.Link) ([]uint64, error)
+}
+
+func (bs *mockBatchSaver) saveBatch(batch [][]model.Link) ([]uint64, error) {
+	if bs.saveBatchFunc != nil {
+		return bs.saveBatchFunc(batch)
+	}
+	return nil, nil
+}
+
 func TestSaver_Close(t *testing.T) {
 	t.Run("close waits for serve to finish", func(t *testing.T) {
-		var bs testBatchSaver
+		bs := &stubBatchSaver{}
+		saver := newBatchSaver(bs.saveBatch, 0, 10*time.Millisecond)
 
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{
-			Delay: 10 * time.Millisecond,
-		})
+		ctx := context.Background()
 
 		// Даем время горутине запуститься
 		time.Sleep(5 * time.Millisecond)
 
-		err := saver.Close()
+		err := saver.Close(ctx)
 		be.Err(t, err, nil)
 
 		// Повторный вызов Close возвращает ошибку
-		err = saver.Close()
-		be.Err(t, err, ErrSaverClosed)
+		err = saver.Close(ctx)
+		be.Err(t, err, ErrBatchSaverClosed)
 	})
 
 	t.Run("close saves pending queue", func(t *testing.T) {
-		var bs testBatchSaver
+		bs := &fakeBatchSaver{}
 
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{
-			QueueSize: 100,
-			Delay:     100 * time.Millisecond,
-		})
+		saver := newBatchSaver(bs.saveBatch, 100, 100*time.Millisecond)
 
 		// Даем время горутине запуститься
 		time.Sleep(5 * time.Millisecond)
@@ -68,25 +87,87 @@ func TestSaver_Close(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 
 		// Закрываем saver - должен сохранить очередь
-		saver.Close()
+		saver.Close(ctx)
 
 		// Ждем ответ от Save
 		be.Err(t, <-errCh, nil)
 
 		// Проверяем, что данные были сохранены
-		be.Equal(t, bs.count, 1)
+		be.Equal(t, bs.calls, 1)
+		be.Equal(be.Require(t), len(bs.data), 1)
+		be.Equal(t, bs.data[0], links)
 	})
+}
+
+func TestPendingSaver_NoConcurrentSaveBatch(t *testing.T) {
+	var (
+		inProcess atomic.Bool
+		calls     atomic.Int32
+	)
+
+	bs := &mockBatchSaver{
+		saveBatchFunc: func(batch [][]model.Link) ([]uint64, error) {
+			calls.Add(1)
+			if !inProcess.CompareAndSwap(false, true) {
+				panic("SaveBatch called concurrently!")
+			}
+			defer inProcess.Store(false)
+			time.Sleep(10 * time.Millisecond)
+			return make([]uint64, len(batch)), nil
+		},
+	}
+
+	saver := newBatchSaver(bs.saveBatch, 1000, 10*time.Millisecond)
+	defer saver.Close(context.Background())
+
+	var mu sync.Mutex
+	minimum := time.Now().Add(100500 * time.Second)
+	maximum := time.Time{}
+
+	const N = 10000
+	err := func() (err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("panic: %v", p)
+			}
+		}()
+
+		var eg errgroup.Group
+		for i := range N {
+			i := i // да перестанут в меня тыкать! (если что, то в go.mod v1.24)
+			eg.Go(func() error {
+				time.Sleep(time.Duration(i%1000) * time.Millisecond)
+				mu.Lock()
+				t := time.Now()
+				if t.Before(minimum) {
+					minimum = t
+				}
+				if t.After(maximum) {
+					maximum = t
+				}
+				mu.Unlock()
+				_, err := saver.Save(context.Background(), nil)
+				return err
+			})
+		}
+		be.Err(t, eg.Wait(), nil)
+
+		return nil
+	}()
+
+	t.Logf("elapsed: %v calls: %v", maximum.Sub(minimum), calls.Load())
+	be.True(t, calls.Load() > 0)
+	be.Err(t, err, nil)
 }
 
 func TestSaver_Save(t *testing.T) {
 	t.Run("successful save", func(t *testing.T) {
-		var bs testBatchSaver
+		bs := &fakeBatchSaver{}
 
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{
-			QueueSize: 100,
-			Delay:     100 * time.Millisecond,
-		})
-		defer saver.Close()
+		ctx := context.Background()
+
+		saver := newBatchSaver(bs.saveBatch, 100, 100*time.Millisecond)
+		defer saver.Close(ctx)
 
 		// Даем время горутине запуститься
 		time.Sleep(5 * time.Millisecond)
@@ -94,21 +175,23 @@ func TestSaver_Save(t *testing.T) {
 		// Сохраняем данные
 		links := []model.Link{{Name: "Test", URL: "https://example.com"}}
 
-		_, err := saver.Save(context.Background(), links)
+		_, err := saver.Save(ctx, links)
 		be.Err(t, err, nil)
 
 		// Ждем обработки
 		time.Sleep(110 * time.Millisecond)
 
 		// Проверяем, что данные были сохранены
-		be.Equal(t, bs.count, 1)
+		be.Equal(t, bs.calls, 1)
 	})
 
 	t.Run("save with context cancellation before send", func(t *testing.T) {
-		var bs testBatchSaver
+		bs := fakeBatchSaver{}
 
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{})
-		defer saver.Close()
+		ctx := context.Background()
+
+		saver := newBatchSaver(bs.saveBatch, 1, 1)
+		defer saver.Close(ctx)
 
 		// Даем время горутине запуститься
 		time.Sleep(5 * time.Millisecond)
@@ -125,12 +208,12 @@ func TestSaver_Save(t *testing.T) {
 	t.Run("save with context cancellation after send", func(t *testing.T) {
 		// Этот тест проверяет, что если контекст отменяется после отправки в канал,
 		// но до получения ответа, то возвращается ошибка контекста
-		var bs testBatchSaver
+		bs := &fakeBatchSaver{}
 
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{
-			Delay: 500 * time.Millisecond, // Долгий таймаут
-		})
-		defer saver.Close()
+		ctx := context.Background()
+
+		saver := newBatchSaver(bs.saveBatch, 100, 500*time.Millisecond) // Долгий таймаут
+		defer saver.Close(ctx)
 
 		// Даем время горутине запуститься
 		time.Sleep(5 * time.Millisecond)
@@ -145,34 +228,33 @@ func TestSaver_Save(t *testing.T) {
 	})
 
 	t.Run("save after close returns error", func(t *testing.T) {
-		var bs testBatchSaver
-
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{})
-
-		// Закрываем сразу
-		saver.Close()
+		bs := &fakeBatchSaver{}
 
 		ctx := context.Background()
+
+		saver := newBatchSaver(bs.saveBatch, 1, 1)
+
+		// Закрываем сразу
+		saver.Close(ctx)
+
 		links := []model.Link{{Name: "Test", URL: "https://example.com"}}
 		_, err := saver.Save(ctx, links)
-		be.Err(t, err, ErrSaverClosed)
+		be.Err(t, err, ErrBatchSaverClosed)
 	})
 
 	t.Run("batch save on queue size limit", func(t *testing.T) {
-		var bs testBatchSaver
+		bs := &fakeBatchSaver{}
+
+		ctx := context.Background()
 
 		// Маленький размер очереди для теста
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{
-			QueueSize: 3,
-			Delay:     500 * time.Millisecond, // Долгий таймаут
-		})
-		defer saver.Close()
+		saver := newBatchSaver(bs.saveBatch, 3, 500*time.Millisecond) // Долгий таймаут
+		defer saver.Close(ctx)
 
 		// Даем время горутине запуститься
 		time.Sleep(5 * time.Millisecond)
 
 		// Отправляем 3 запроса - должен сработать лимит очереди
-		ctx := context.Background()
 		links := []model.Link{{Name: "Test", URL: "https://example.com"}}
 
 		for i := 0; i < 3; i++ {
@@ -184,23 +266,23 @@ func TestSaver_Save(t *testing.T) {
 		// Ждем обработки
 		time.Sleep(100 * time.Millisecond)
 
-		be.Equal(t, bs.count, 3)
+		be.Equal(t, bs.calls, 1)
+		be.Equal(t, len(bs.data), 3)
 	})
 
 	t.Run("batch save on timeout", func(t *testing.T) {
-		var bs testBatchSaver
+		bs := &fakeBatchSaver{}
+
+		ctx := context.Background()
 
 		// Короткий таймаут для теста
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{
-			Delay: 20 * time.Millisecond,
-		})
-		defer saver.Close()
+		saver := newBatchSaver(bs.saveBatch, 100, 20*time.Millisecond)
+		defer saver.Close(ctx)
 
 		// Даем время горутине запуститься
 		time.Sleep(5 * time.Millisecond)
 
 		// Отправляем один запрос
-		ctx := context.Background()
 		links := []model.Link{{Name: "Test", URL: "https://example.com"}}
 
 		go func() {
@@ -211,39 +293,39 @@ func TestSaver_Save(t *testing.T) {
 		time.Sleep(30 * time.Millisecond)
 
 		// Должен быть вызов Update
-		be.Equal(t, bs.count, 1)
+		be.Equal(t, bs.calls, 1)
 	})
 
 	t.Run("database error propagates", func(t *testing.T) {
-		saveBatch := func(ctx context.Context, batch [][]model.Link) ([]uint64, error) {
-			return nil, errors.New("save batch error")
+		bs := &mockBatchSaver{
+			saveBatchFunc: func(batch [][]model.Link) ([]uint64, error) {
+				return nil, errors.New("unknown error")
+			},
 		}
 
-		saver := newPendingSaver(saveBatch, pendingSaverConfig{
-			Delay: 10 * time.Millisecond,
-		})
-		defer saver.Close()
+		ctx := context.Background()
+
+		saver := newBatchSaver(bs.saveBatch, 100, 10*time.Millisecond)
+		defer saver.Close(ctx)
 
 		// Даем время горутине запуститься
 		time.Sleep(5 * time.Millisecond)
 
-		ctx := context.Background()
 		links := []model.Link{{Name: "Test", URL: "https://example.com"}}
 
 		_, err := saver.Save(ctx, links)
-		be.Err(t, err, "save batch error")
+		be.Err(t, err, "unknown error")
 	})
 }
 
 func TestSaver_ServeQueue(t *testing.T) {
 	t.Run("multiple concurrent saves", func(t *testing.T) {
-		var bs testBatchSaver
+		bs := &fakeBatchSaver{}
 
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{
-			QueueSize: 10,
-			Delay:     100 * time.Millisecond,
-		})
-		defer saver.Close()
+		ctx := context.Background()
+
+		saver := newBatchSaver(bs.saveBatch, 10, 100*time.Millisecond)
+		defer saver.Close(ctx)
 
 		// Даем время горутине запуститься
 		time.Sleep(5 * time.Millisecond)
@@ -255,7 +337,6 @@ func TestSaver_ServeQueue(t *testing.T) {
 
 		for i := 0; i < numSaves; i++ {
 			go func(idx int) {
-				ctx := context.Background()
 				links := []model.Link{{Name: "Test", URL: "https://example.com"}}
 				id, err := saver.Save(ctx, links)
 				if err == nil {
@@ -284,21 +365,21 @@ func TestSaver_ServeQueue(t *testing.T) {
 		be.Equal(t, len(ids), numSaves)
 
 		// Проверяем, что все ID были обработаны
-		be.Equal(t, bs.count, numSaves)
+		be.Equal(t, len(bs.data), numSaves)
 	})
 
 	t.Run("empty queue does nothing", func(t *testing.T) {
-		var bs testBatchSaver
+		bs := &fakeBatchSaver{}
 
-		saver := newPendingSaver(bs.saveBatch, pendingSaverConfig{
-			Delay: 10 * time.Millisecond,
-		})
-		defer saver.Close()
+		ctx := context.Background()
+
+		saver := newBatchSaver(bs.saveBatch, 100, 10*time.Millisecond)
+		defer saver.Close(ctx)
 
 		// Даем время горутине запуститься
 		time.Sleep(20 * time.Millisecond)
 
 		// Таймер сработает, но очередь пуста - update не должен вызываться
-		be.Equal(t, bs.count, 0)
+		be.Equal(t, bs.calls, 0)
 	})
 }

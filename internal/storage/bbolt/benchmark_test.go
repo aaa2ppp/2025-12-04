@@ -18,9 +18,11 @@ import (
 	"github.com/aaa2ppp/be"
 )
 
-const benchMaxSaveDelay = 5 * time.Millisecond
+const benchMaxBatchDelay = 10 * time.Millisecond
 
 func BenchmarkStorage_Save(b *testing.B) {
+	storLogger := slog.New(slog.DiscardHandler)
+
 	tests := []struct {
 		name string
 		cfg  Config
@@ -28,46 +30,35 @@ func BenchmarkStorage_Save(b *testing.B) {
 		{
 			"NoSync:No syncer:No saver:No",
 			Config{
-				NoSync:       false,
-				MaxCache:     -1,
-				MaxSyncDelay: -1,
-				MaxSaveDelay: -1,
+				NoSync: false,
 			},
 		},
 		{
 			"NoSync:Yes syncer:No saver:No",
 			Config{
-				NoSync:       true,
-				MaxCache:     -1,
-				MaxSyncDelay: -1,
-				MaxSaveDelay: -1,
+				NoSync: true,
 			},
 		},
 		{
 			"NoSync:Yes syncer:Yes saver:No",
 			Config{
-				NoSync:       true,
-				MaxCache:     -1,
-				MaxSyncDelay: 0,
-				MaxSaveDelay: -1,
+				NoSync:         true,
+				MaxSyncDelay:   100 * time.Millisecond,
+				MaxSyncPending: 1000,
 			},
 		},
 		{
 			"NoSync:No syncer:No saver:Yes",
 			Config{
-				Timeout:          1 * time.Second, // передается bbolt.DB
-				NoSync:           false,           // передается bbolt.DB
-				MaxCache:         -1,
-				MaxSyncDelay:     -1,
-				MaxSaveDelay:     benchMaxSaveDelay,
-				MaxSaveQueueSize: runtime.GOMAXPROCS(0) * 2, // чтобы зависело только от delay
+				NoSync:        false,
+				MaxBatchDelay: benchMaxBatchDelay,
+				MaxBatchSize:  runtime.GOMAXPROCS(0) * 2,
 			},
 		},
 		// TODO
 	}
 
-	storLogger := slog.New(slog.DiscardHandler)
-	ctx := logger.Context(context.Background(), storLogger)
+	ctx := context.Background()
 
 	links := []model.Link{
 		{Name: "Test Link 1", URL: "https://example.com/1"},
@@ -87,7 +78,9 @@ func BenchmarkStorage_Save(b *testing.B) {
 				if err != nil {
 					b.Fatalf("open: %v", err)
 				}
-				defer storage.Close()
+				defer storage.Close(ctx)
+
+				b.ResetTimer()
 
 				for i := 0; i < b.N; i++ {
 					_, err := storage.Save(ctx, links)
@@ -111,9 +104,7 @@ func BenchmarkStorage_Save(b *testing.B) {
 				if err != nil {
 					b.Fatalf("open: %v", err)
 				}
-				defer storage.Close()
-
-				ctx := logger.Context(context.Background(), storLogger)
+				defer storage.Close(ctx)
 
 				b.ResetTimer()
 
@@ -186,8 +177,6 @@ func clientLoop(ctx context.Context, stor *Storage, in <-chan []model.Link, out 
 }
 
 func BenchmarkStorage_ConcurentSaveWithSaver(b *testing.B) {
-	storLogger := slog.New(slog.DiscardHandler)
-
 	tests := []struct {
 		name string
 		cfg  Config
@@ -195,45 +184,29 @@ func BenchmarkStorage_ConcurentSaveWithSaver(b *testing.B) {
 		{
 			"queue10",
 			Config{
-				Timeout:          1 * time.Second, // передается bbolt.DB
-				NoSync:           false,           // передается bbolt.DB
-				MaxCache:         -1,
-				MaxSyncDelay:     -1,
-				MaxSaveDelay:     benchMaxSaveDelay,
-				MaxSaveQueueSize: 10,
+				MaxBatchDelay: benchMaxBatchDelay,
+				MaxBatchSize:  10,
 			},
 		},
 		{
 			"queue100",
 			Config{
-				Timeout:          1 * time.Second, // передается bbolt.DB
-				NoSync:           false,           // передается bbolt.DB
-				MaxCache:         -1,
-				MaxSyncDelay:     -1,
-				MaxSaveDelay:     benchMaxSaveDelay,
-				MaxSaveQueueSize: 100,
+				MaxBatchDelay: benchMaxBatchDelay,
+				MaxBatchSize:  100,
 			},
 		},
 		{
 			"queue1000",
 			Config{
-				Timeout:          1 * time.Second, // передается bbolt.DB
-				NoSync:           false,           // передается bbolt.DB
-				MaxCache:         -1,
-				MaxSyncDelay:     -1,
-				MaxSaveDelay:     benchMaxSaveDelay,
-				MaxSaveQueueSize: 1000,
+				MaxBatchDelay: benchMaxBatchDelay,
+				MaxBatchSize:  1000,
 			},
 		},
 		{
 			"queue10000",
 			Config{
-				Timeout:          1 * time.Second, // передается bbolt.DB
-				NoSync:           false,           // передается bbolt.DB
-				MaxCache:         -1,
-				MaxSyncDelay:     -1,
-				MaxSaveDelay:     benchMaxSaveDelay,
-				MaxSaveQueueSize: 10000,
+				MaxBatchDelay: benchMaxBatchDelay,
+				MaxBatchSize:  10000,
 			},
 		},
 		// TODO
@@ -244,19 +217,16 @@ func BenchmarkStorage_ConcurentSaveWithSaver(b *testing.B) {
 			tmpFile := filepath.Join(b.TempDir(), "bench.db")
 
 			tt.cfg.DataFile = tmpFile
-			tt.cfg.Logger = storLogger
+			tt.cfg.Logger = slog.New(slog.DiscardHandler)
+
+			ctx := context.Background()
 
 			storage, err := Open(tt.cfg)
 			if err != nil {
 				b.Fatalf("open storage: %v", err)
 				return
 			}
-			defer storage.Close()
-
-			ctx := logger.Context(context.Background(), storLogger)
-
-			// ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			// defer cancel()
+			defer storage.Close(ctx)
 
 			// Подготавливаем тестовые данные один раз
 			links := []model.Link{
@@ -266,7 +236,7 @@ func BenchmarkStorage_ConcurentSaveWithSaver(b *testing.B) {
 			}
 
 			ch := make(chan []model.Link)
-			clients := tt.cfg.MaxSaveQueueSize * 3
+			clients := tt.cfg.MaxBatchSize * 3
 			done := startClientPool(ctx, storage, ch, nil, clients)
 
 			b.ResetTimer()
@@ -296,9 +266,8 @@ func BenchmarkStorage_ConcurentSaveWithSaver(b *testing.B) {
 	}
 }
 
-func BenchmarkStorage_Load(b *testing.B) {
-	os.MkdirAll("./tmp", 0777)
-	tmpFile := filepath.Join("./tmp/bench.db")
+func BenchmarkStorage_LoadWithCache(b *testing.B) {
+	tmpFile := filepath.Join(b.TempDir(), "bench.db")
 
 	N := 100000
 
@@ -308,32 +277,44 @@ func BenchmarkStorage_Load(b *testing.B) {
 		{Name: "Test Link 3", URL: "https://example.com/3"},
 	}
 
-	var ids []uint64
-	{
+	ids := func() []uint64 {
 		start := time.Now()
 
-		cfg := Config{
-			DataFile: tmpFile,
-			Logger:   newTestLogger(),
-			NoSync:   false,
-		}
-
-		storage, err := Open(cfg)
-		be.Err(b, err, nil)
-
-		batch := make([][]model.Link, 0, N)
-		for range N {
+		batch := make([][]model.Link, 0, 2048)
+		for range cap(batch) {
 			batch = append(batch, links)
 		}
 
-		ids, err = storage.SaveBatch(context.Background(), batch)
+		ctx := context.Background()
+
+		storage, err := Open(Config{
+			DataFile: tmpFile,
+			Logger:   newTestLogger(),
+			NoSync:   true,
+		})
 		be.Err(b, err, nil)
 
-		err = storage.Close()
+		allIDs := make([]uint64, 0, N)
+
+		for i, n := 0, N/len(batch); i < n; i++ {
+			curIDs, err := storage.SaveBatch(ctx, batch)
+			be.Err(b, err, nil)
+			allIDs = append(allIDs, curIDs...)
+		}
+
+		if n := N % len(batch); n > 0 {
+			curIDs, err := storage.SaveBatch(ctx, batch[:n])
+			be.Err(b, err, nil)
+			allIDs = append(allIDs, curIDs...)
+		}
+
+		err = storage.Close(ctx)
 		be.Err(b, err, nil)
 
-		b.Logf("saved %d records in %v", len(ids), time.Since(start))
-	}
+		b.Logf("saved %d records in %v", len(allIDs), time.Since(start))
+
+		return allIDs
+	}()
 
 	tests := []struct {
 		name string
@@ -342,31 +323,37 @@ func BenchmarkStorage_Load(b *testing.B) {
 		{
 			"0%",
 			Config{
-				MaxCache: -1,
+				CacheSize: 0,
 			},
 		},
 		{
 			"3%",
 			Config{
-				MaxCache: N / 33,
+				CacheSize: N / 33,
 			},
 		},
 		{
 			"10%",
 			Config{
-				MaxCache: N / 10,
+				CacheSize: N / 10,
 			},
 		},
 		{
 			"25%",
 			Config{
-				MaxCache: N / 4,
+				CacheSize: N / 4,
 			},
 		},
 		{
 			"50%",
 			Config{
-				MaxCache: N / 2,
+				CacheSize: N / 2,
+			},
+		},
+		{
+			"100%",
+			Config{
+				CacheSize: N,
 			},
 		},
 	}
@@ -378,11 +365,21 @@ func BenchmarkStorage_Load(b *testing.B) {
 			}
 			tt.cfg.DataFile = tmpFile
 			tt.cfg.Logger = slog.New(slog.DiscardHandler)
+
 			ctx := logger.Context(context.Background(), tt.cfg.Logger)
 
 			storage, err := Open(tt.cfg)
 			be.Err(b, err, nil)
-			defer storage.Close()
+			defer storage.Close(ctx)
+
+			for i := 0; i < tt.cfg.CacheSize; i++ {
+				j := rand.IntN(N)
+				id := ids[j]
+				_, err := storage.Load(ctx, id)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
 
 			b.ResetTimer()
 

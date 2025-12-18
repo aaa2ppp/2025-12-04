@@ -1,3 +1,10 @@
+// Пакет bbolt предоставляет реализацию хранилища на основе BoltDB.
+//
+// Примечание по отмене контекста:
+//
+// Вызывающий код должен использовать тайм-ауты контекста для управления продолжительностью операции.
+// Хотя методы должным образом проверяют отмену контекста и возвращают ошибки при завершении контекста,
+// базовые транзакции BoltDB могут продолжать выполняться в фоновом режиме из-за архитектуры BoltDB.
 package bbolt
 
 import (
@@ -14,7 +21,6 @@ import (
 	"time"
 
 	"go.etcd.io/bbolt"
-	berrors "go.etcd.io/bbolt/errors"
 
 	"link-checker/internal/logger"
 	"link-checker/internal/model"
@@ -22,93 +28,107 @@ import (
 )
 
 const (
-	DefaultMaxCache = 10000
-	DefaultDataFile = "./data/linksets.db"
-	DefaultTimeout  = 1 * time.Second
-	DefaultNoSync   = true
+	DefaultMaxBatchSize = 2048
 )
 
-const generateIDAttempts = 10
-
-var ErrTooManyIDCollisions = errors.New("too many ID collisions")
-
-var LinkSetBucket = []byte("linksets")
+var linkSetBucket = []byte("linksets")
 
 type Config struct {
+	// DataFile - путь к файлу базы данных (required)
 	DataFile string
-	MaxCache int
-	Timeout  time.Duration
-	NoSync   bool
-	Logger   *slog.Logger
 
-	MaxNotSyncedUpdates int
-	MaxSyncDelay        time.Duration
+	// OpenTimeout - максимальное время ожидания файловой блокировки при открытии базы.
+	// Передается в bbolt.Open.
+	// 0 - ждать бесконечно (по умолчанию).
+	// Не влияет на время выполнения операций чтения/записи.
+	OpenTimeout time.Duration
 
-	MaxSaveQueueSize int
-	MaxSaveDelay     time.Duration
+	// Logger используется для логирования операций базы данных.
+	// Приоритеты использования логгера:
+	// 1. Логгер из контекста (если метод принимает context.Context и в нем установлен логгер)
+	// 2. Этот логгер (если не nil)
+	// 3. slog.Default() (глобальный логгер по умолчанию)
+	Logger *slog.Logger
 
-	CheckIDCollisions bool
+	// NoSync - отключает немедленную синхронизацию с диском.
+	// Игнорируется, если задан MaxSyncDelay или MaxSyncPending.
+	// В этом случае bbolt.Open получает NoSync=true, а управление
+	// синхронизацией осуществляется через MaxSyncDelay/MaxSyncPending.
+	NoSync bool
+
+	// READ CACHE
+
+	// CacheSize - максимальное количество записей в LRU кеше.
+	// Значение <= 0 отключает кеш.
+	CacheSize int
+
+	// DISK SYNC (отложенная синхронизация)
+
+	// MaxSyncDelay - если > 0, задает максимальное время,
+	// в течение которого запись может оставаться не синхронизированной с диском.
+	// После истечения этого времени все накопленные изменения сбрасываются на диск.
+	// Если заданы и MaxSyncDelay, и MaxSyncPending - срабатывает первое ограничение.
+	MaxSyncDelay time.Duration
+
+	// MaxSyncPending - если > 0, задает максимальное количество операций записи,
+	// которые могут накопиться без синхронизации. При достижении этого порога
+	// выполняется принудительная синхронизация.
+	// Для Save каждая операция считается отдельно, для SaveBatch - размер пакета.
+	// Если заданы и MaxSyncDelay, и MaxSyncPending - срабатывает первое ограничение.
+	MaxSyncPending int
+
+	// WRITE BATCHING (группировка операций)
+
+	// MaxBatchDelay - если > 0, одиночные операции Save объединяются в пакеты.
+	// Определяет максимальное время ожидания перед выполнением собранного пакета.
+	// Если MaxBatchDelay > 0, а MaxBatchSize <= 0, используется DefaultMaxBatchSize.
+	// NOTE: Если между вызовами Save происходит явный вызов SaveBatch,
+	// он выполняется немедленно и не объединяется с накапливаемым пакетом.
+	// Это поведение может измениться в будущем.
+	MaxBatchDelay time.Duration
+
+	// MaxBatchSize - если > 0, задает максимальный размер пакета операций.
+	// При достижении этого размера пакет выполняется немедленно.
+	// Если задан MaxBatchDelay, но MaxBatchSize <= 0,
+	// используется значение DefaultMaxBatchSize.
+	MaxBatchSize int
 }
 
 type Storage struct {
-	db *bbolt.DB
-	*storage
-	pending *pendingSaver
+	db         DB
+	cache      *cache
+	logger     *slog.Logger
+	lazySyncer *lazySyncer
+	batchSaver *batchSaver
 }
 
+// Open открывает базу данных с заданной конфигурацией.
 func Open(cfg Config) (*Storage, error) {
 	logger := cmp.Or(cfg.Logger, slog.Default())
 
-	var cache *cache
-	if cfg.MaxCache >= 0 {
-		maxCache := cmp.Or(cfg.MaxCache, DefaultMaxCache)
-		cache = newCache(maxCache)
+	if cfg.DataFile == "" {
+		return nil, errors.New("DataFile is required")
 	}
 
-	dataFile := cmp.Or(cfg.DataFile, DefaultDataFile)
-
-	dir := filepath.Dir(dataFile)
+	dir := filepath.Dir(cfg.DataFile)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
 	bops := &bbolt.Options{
-		Timeout: max(cmp.Or(cfg.Timeout, DefaultTimeout), 0),
-		NoSync:  cfg.NoSync,
+		Timeout: max(cfg.OpenTimeout, 0),
+		NoSync:  cfg.NoSync || cfg.MaxSyncDelay > 0 || cfg.MaxSyncPending > 0,
 	}
 
-	logger.Info("open database", "data_file", dataFile, "timeout", bops.Timeout, "no_sync", bops.NoSync)
+	logger.Info("open database", "data_file", cfg.DataFile, "open_timeout", bops.Timeout, "sync_mode", syncModeName(cfg))
 
-	db, err := bbolt.Open(dataFile, 0600, bops)
+	db, err := bbolt.Open(cfg.DataFile, 0600, bops)
 	if err != nil {
 		return nil, fmt.Errorf("open bolt db: %w", err)
 	}
 
-	var syncer *periodicSyncer
-	if cfg.NoSync && cfg.MaxNotSyncedUpdates >= 0 && cfg.MaxSyncDelay >= 0 {
-		syncer = newSyncer(bboltDB{db}, logger, syncerConfig{
-			maxNotSyncedUpdates: cfg.MaxNotSyncedUpdates,
-			maxSyncDelay:        cfg.MaxSyncDelay,
-		})
-	}
-
-	storage := &storage{
-		db:     bboltDB{db},
-		cache:  cache,
-		syncer: syncer,
-		logger: logger,
-	}
-
-	var pending *pendingSaver
-	if cfg.MaxSaveQueueSize >= 0 && cfg.MaxSaveDelay >= 0 {
-		pending = newPendingSaver(storage.SaveBatch, pendingSaverConfig{
-			QueueSize: cfg.MaxSaveQueueSize,
-			Delay:     cfg.MaxSaveDelay,
-		})
-	}
-
 	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(LinkSetBucket)
+		_, err := tx.CreateBucketIfNotExists(linkSetBucket)
 		return err
 	})
 	if err != nil {
@@ -116,91 +136,106 @@ func Open(cfg Config) (*Storage, error) {
 		return nil, fmt.Errorf("init bucket: %w", err)
 	}
 
-	return &Storage{
-		db:      db,
-		storage: storage,
-		pending: pending,
-	}, nil
-}
-
-func makeKey(id uint64) []byte {
-	key := make([]byte, 8)
-	binary.BigEndian.PutUint64(key, id)
-	return key
-}
-
-func generateID(b Bucket) (uint64, []byte, error) {
-	for range generateIDAttempts {
-		id := rand.Uint64()
-		if id == 0 {
-			continue
-		}
-
-		key := makeKey(id)
-		if b != nil && b.Get(key) != nil {
-			continue
-		}
-
-		return id, key, nil
+	var cache *cache
+	if cfg.CacheSize > 0 {
+		cache = newCache(cfg.CacheSize)
 	}
 
-	return 0, nil, ErrTooManyIDCollisions
-}
-
-func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) {
-	if s.pending != nil {
-		return s.pending.Save(ctx, links)
+	storage := &Storage{
+		db:     bboltDB{db},
+		cache:  cache,
+		logger: logger,
 	}
-	return s.storage.Save(ctx, links)
+
+	var lazySyncer *lazySyncer
+	if cfg.MaxSyncDelay > 0 || cfg.MaxSyncPending > 0 {
+		lazySyncer = newLazySyncer(
+			storage.sync,
+			cfg.MaxSyncPending,
+			cfg.MaxSyncDelay,
+		)
+		storage.lazySyncer = lazySyncer
+	}
+
+	if cfg.MaxBatchDelay > 0 && cfg.MaxBatchSize <= 0 {
+		logger.Warn("MaxBatchDelay set but MaxBatchSize not set, using default", "default", DefaultMaxBatchSize)
+	}
+
+	var batchSaver *batchSaver
+	if cfg.MaxBatchDelay > 0 || cfg.MaxBatchSize > 0 {
+		batchSize := cfg.MaxBatchSize
+		if batchSize <= 0 {
+			batchSize = DefaultMaxBatchSize
+		}
+		batchSaver = newBatchSaver(
+			func(batch [][]model.Link) ([]uint64, error) {
+				return storage.saveBatch(context.Background(), batch)
+			},
+			batchSize,
+			cfg.MaxBatchDelay,
+		)
+		storage.batchSaver = batchSaver
+	}
+
+	return storage, nil
 }
 
-func (s *Storage) Close() error {
+func syncModeName(cfg Config) string {
+	switch {
+	case cfg.MaxSyncDelay > 0 || cfg.MaxSyncPending > 0:
+		return "lazy_sync"
+	case cfg.NoSync:
+		return "no_sync"
+	default:
+		return "immediate"
+	}
+}
+
+func (s *Storage) Close(ctx context.Context) error {
 	const op = "Storage.Close"
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	s.logger.Info("close database")
 
-	if s.saver != nil {
-		if err := s.saver.Close(); err != nil {
-			s.logger.Warn("close saver failed", "op", op, "error", err)
+	if s.batchSaver != nil {
+		if err := s.batchSaver.Close(ctx); err != nil {
+			s.logger.Warn("close batch saver failed", "op", op, "error", err)
 		}
 	}
 
-	if s.syncer != nil {
-		s.syncer.Close()
+	if s.lazySyncer != nil {
+		s.lazySyncer.Close()
 	}
 
-	if s.db.NoSync {
-		// Гарантируем, что после выхода из Close все изменения будут сохранены на диске.
-		// После сброса флага NoSync последующие транзакции записи будут выполняться fdatasync.
-		s.db.NoSync = false
+	var (
+		done = make(chan struct{}, 1)
+		err  error
+	)
+	go func() {
+		defer close(done)
+		err = s.db.Close()
+	}()
 
-		// Гарантируем, что после сброса флага NoSync будет по крайней мере одна транзакция записи,
-		// котрая выполнит fdatasync.
-		err := s.db.Update(func(tx *bbolt.Tx) error { return nil })
-		if err != nil && err != berrors.ErrDatabaseNotOpen {
-			s.logger.Warn("final sync transaction failed", "op", op, "error", err)
-		}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
 	}
 
-	// db.Close ожидает завершения всех незавершенных транзакций (если такие есть).
-	// В bbolt одновременно может существовать только одна транзакция записи.
-	// Это означает, что транзакции записи, которые ожидает db.Close, выполняются после
-	// нашей пустой транзакции и, следовательно, после сброса флага NoSync и будут
-	// выполнять fdatasync.
-	return s.db.Close()
+	if err != nil {
+		s.logger.Error("database close failed", "op", op, "error", err)
+		return model.ErrInternalError
+	}
+
+	return nil
 }
 
-type storage struct {
-	db     DB
-	cache  *cache
-	syncer *periodicSyncer
-	saver  *pendingSaver
-	logger *slog.Logger
-}
-
-func (s *storage) Save(ctx context.Context, links []model.Link) (uint64, error) {
-	if s.saver != nil {
-		return s.saver.Save(ctx, links)
+func (s *Storage) Save(ctx context.Context, links []model.Link) (uint64, error) {
+	if s.batchSaver != nil {
+		return s.batchSaver.Save(ctx, links)
 	}
 
 	resp, err := s.SaveBatch(ctx, [][]model.Link{links})
@@ -210,8 +245,105 @@ func (s *storage) Save(ctx context.Context, links []model.Link) (uint64, error) 
 	return resp[0], nil
 }
 
-func (s *storage) SaveBatch(ctx context.Context, links [][]model.Link) ([]uint64, error) {
-	const op = "Storage.SaveBatch"
+func (s *Storage) SaveBatch(ctx context.Context, links [][]model.Link) ([]uint64, error) {
+	if len(links) == 0 {
+		return nil, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// BBolt не поддерживает контекст - выполняем транзакцию в отдельной горутине проверяя контекст
+	var (
+		ids  []uint64
+		err  error
+		done = make(chan struct{}, 1)
+	)
+	go func() {
+		defer close(done)
+		ids, err = s.saveBatch(ctx, links)
+	}()
+
+	// Ждем завершения транзакции или отмены контекста
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-done:
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return ids, nil
+}
+
+func (s *Storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
+	resp, err := s.LoadBatch(ctx, []uint64{id})
+	if err != nil {
+		return model.LinkSet{}, err
+	}
+	if !resp.Found[0] {
+		return model.LinkSet{}, model.ErrNotFound
+	}
+	return resp.LinkSets[0], nil
+}
+
+func (s *Storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, error) {
+	if err := ctx.Err(); err != nil {
+		return LinkSetBatch{}, err
+	}
+
+	var (
+		batch LinkSetBatch
+		err   error
+		done  = make(chan struct{}, 1)
+	)
+	go func() {
+		defer close(done)
+		batch, err = s.loadBatch(ctx, ids)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return LinkSetBatch{}, ctx.Err()
+	case <-done:
+	}
+
+	if err != nil {
+		return LinkSetBatch{}, err
+	}
+
+	return batch, nil
+}
+
+func makeKey(id uint64) []byte {
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, id)
+	return key
+}
+
+func generateID(b Bucket) (uint64, []byte, error) {
+	for range 10 {
+		id := rand.Uint64()
+		if id == 0 {
+			continue
+		}
+
+		key := makeKey(id)
+		if b.Get(key) != nil {
+			continue
+		}
+
+		return id, key, nil
+	}
+
+	return 0, nil, errors.New("too many ID collisions")
+}
+
+func (s *Storage) saveBatch(ctx context.Context, links [][]model.Link) ([]uint64, error) {
+	const op = "Storage.saveBatch"
 
 	if len(links) == 0 {
 		return nil, nil
@@ -222,12 +354,16 @@ func (s *storage) SaveBatch(ctx context.Context, links [][]model.Link) ([]uint64
 
 	// Сохраняем пачку запрос в базу одной транзакцией
 	err := s.db.Update(func(tx Tx) error {
-		b := tx.Bucket(LinkSetBucket)
+		b := tx.Bucket(linkSetBucket)
 
 		for i := range links {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
 			id, key, err := generateID(b)
 			if err != nil {
-				s.logger.Error("generate id failed", "op", op, "error", err)
+				logger.FromContextDef(ctx, s.logger).Error("generate id failed", "op", op, "error", err)
 				return model.ErrInternalError
 			}
 
@@ -240,12 +376,12 @@ func (s *storage) SaveBatch(ctx context.Context, links [][]model.Link) ([]uint64
 
 			data, err := json.Marshal(linkSet)
 			if err != nil {
-				s.logger.Error("marshal linkset failed", "op", op, "error", err)
+				logger.FromContextDef(ctx, s.logger).Error("marshal linkset failed", "op", op, "error", err)
 				return model.ErrInternalError
 			}
 
 			if err := b.Put(key, data); err != nil {
-				s.logger.Error("database write failed", "op", op, "error", err)
+				logger.FromContextDef(ctx, s.logger).Error("database write failed", "op", op, "error", err)
 				return model.ErrInternalError
 			}
 		}
@@ -254,11 +390,14 @@ func (s *storage) SaveBatch(ctx context.Context, links [][]model.Link) ([]uint64
 	})
 
 	if err != nil {
-		return nil, err
+		if err != model.ErrInternalError {
+			logger.FromContextDef(ctx, s.logger).Error("database update failed", "op", op, "error", err)
+		}
+		return nil, model.ErrInternalError
 	}
 
-	if s.syncer != nil {
-		s.syncer.Update()
+	if s.lazySyncer != nil {
+		s.lazySyncer.Update(len(ids))
 	}
 
 	if s.cache != nil {
@@ -278,42 +417,31 @@ func (s *storage) SaveBatch(ctx context.Context, links [][]model.Link) ([]uint64
 
 type LinkSetBatch = service.LinkSetBatch
 
-func (s *storage) Load(ctx context.Context, id uint64) (model.LinkSet, error) {
-	resp, err := s.LoadBatch(ctx, []uint64{id})
-	if err != nil {
-		return model.LinkSet{}, err
-	}
-	return resp.LinkSets[0], nil
-}
-
-func (s *storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, error) {
-	const op = "Storage.LoadBatch"
+func (s *Storage) loadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, error) {
+	const op = "Storage.loadBatch"
 
 	linkSets := make([]model.LinkSet, len(ids))
 	found := make([]bool, len(ids))
-	foundCount := 0
 
-	for i, id := range ids {
-		if linkSet := s.cache.Get(id); linkSet != nil {
-			linkSets[i] = linkSet.Clone()
-			found[i] = true
-			foundCount++
+	if s.cache != nil {
+		count := 0
+		s.cache.Do(func(lc lockedCache) {
+			for i, id := range ids {
+				if linkSet := lc.Get(id); linkSet != nil {
+					linkSets[i] = linkSet.Clone()
+					found[i] = true
+					count++
+				}
+			}
+		})
+		if count == len(ids) {
+			return LinkSetBatch{LinkSets: linkSets, Found: found}, nil
 		}
-
 	}
 
-	if foundCount == len(ids) {
-		return LinkSetBatch{LinkSets: linkSets, Found: found}, nil
-	}
-
-	if err := ctx.Err(); err != nil {
-		return LinkSetBatch{}, err
-	}
-
-	var data []byte
-
+	var loaded []int
 	err := s.db.View(func(tx Tx) error {
-		b := tx.Bucket(LinkSetBucket)
+		b := tx.Bucket(linkSetBucket)
 
 		for i, id := range ids {
 			if found[i] {
@@ -325,7 +453,7 @@ func (s *storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, er
 			}
 
 			key := makeKey(id)
-			data = b.Get(key)
+			data := b.Get(key)
 			if data == nil {
 				continue
 			}
@@ -335,26 +463,42 @@ func (s *storage) LoadBatch(ctx context.Context, ids []uint64) (LinkSetBatch, er
 				return model.ErrInternalError
 			}
 
-			if s.cache != nil {
-				cloned := linkSets[i].Clone()
-				s.cache.Put(&cloned)
-			}
-
 			found[i] = true
-			foundCount++
-		}
 
+			if s.cache != nil {
+				loaded = append(loaded, i)
+			}
+		}
 		return nil
 	})
+
 	if err != nil {
-		if errors.Is(err, model.ErrInternalError) {
-			return LinkSetBatch{}, err
+		if err != model.ErrInternalError {
+			logger.FromContextDef(ctx, s.logger).Error("database update failed", "op", op, "error", err)
 		}
-		logger.FromContextDef(ctx, s.logger).Error("database read failed", "op", op, "error", err)
-		return LinkSetBatch{}, model.ErrInternalError
+		return service.LinkSetBatch{}, model.ErrInternalError
+	}
+
+	if s.cache != nil {
+		s.cache.Do(func(lc lockedCache) {
+			for _, i := range loaded {
+				cloned := linkSets[i].Clone()
+				lc.Put(&cloned)
+			}
+		})
 	}
 
 	return LinkSetBatch{LinkSets: linkSets, Found: found}, nil
+}
+
+func (s *Storage) sync() error {
+	const op = "Storage.sync"
+
+	if err := s.db.Sync(); err != nil {
+		s.logger.Error("database sync failed", "op", op, "error", err)
+		return model.ErrInternalError
+	}
+	return nil
 }
 
 var _ service.LinkStorage = &Storage{}

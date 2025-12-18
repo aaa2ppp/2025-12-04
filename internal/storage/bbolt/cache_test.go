@@ -13,7 +13,7 @@ func TestNewCache(t *testing.T) {
 		cache := newCache(10)
 		be.True(t, cache != nil)
 		be.Equal(t, 0, cache.size)
-		be.Equal(t, 10, cache.maxSize)
+		be.Equal(t, 10, cache.capacity)
 		be.True(t, cache.items != nil)
 		be.True(t, cache.lru != nil)
 	})
@@ -211,7 +211,7 @@ func TestCache_Do(t *testing.T) {
 		}
 
 		// Проверяем, что кэш в валидном состоянии
-		be.True(t, c.size <= c.maxSize)
+		be.True(t, c.size <= c.capacity)
 		be.Equal(t, c.size, c.lru.Len())
 	})
 }

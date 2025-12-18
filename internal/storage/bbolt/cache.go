@@ -13,25 +13,25 @@ type cacheEntry struct {
 }
 
 type cache struct {
-	items   map[uint64]cacheEntry
-	lru     *list.List
-	mux     sync.Mutex
-	size    int
-	maxSize int
+	items    map[uint64]cacheEntry
+	lru      *list.List
+	mux      sync.Mutex
+	size     int
+	capacity int
 }
 
-func newCache(maxSize int) *cache {
-	if maxSize <= 0 {
-		panic("newCache: maxSize must be positive")
+func newCache(capacity int) *cache {
+	if capacity <= 0 {
+		panic("newCache: capacity must be positive")
 	}
 
-	items := make(map[uint64]cacheEntry, maxSize)
+	items := make(map[uint64]cacheEntry, capacity)
 	lru := list.New()
 
 	return &cache{
-		items:   items,
-		lru:     lru,
-		maxSize: maxSize,
+		items:    items,
+		lru:      lru,
+		capacity: capacity,
 	}
 }
 
@@ -56,7 +56,7 @@ func (c *cache) get(id uint64) *model.LinkSet {
 	return nil
 }
 
-// Put обновляет/добавляет запись в кэше. Паникует если ресивер nil.
+// Put обновляет/добавляет запись в кэш. Паникует если ресивер nil.
 // Поднимает приоритет записи в кэше.
 // При необходимости удаляет низкоприоритетные записи.
 func (c *cache) Put(linkSet *model.LinkSet) {
@@ -77,7 +77,7 @@ func (c *cache) set(id uint64, linkSet *model.LinkSet) {
 		elem = entry.elem
 		c.lru.MoveToFront(elem)
 	} else {
-		if c.size >= c.maxSize { // конструктор гарантирует, maxSize > 0
+		if c.size >= c.capacity { // конструктор гарантирует, capacity > 0
 			oldest := c.lru.Back()
 			c.lru.Remove(oldest)
 			oldID := oldest.Value.(uint64)

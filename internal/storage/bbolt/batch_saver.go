@@ -1,7 +1,6 @@
 package bbolt
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"math"
@@ -11,17 +10,9 @@ import (
 	"link-checker/internal/model"
 )
 
-const (
-	DefaultSaveQueueSize = 2048
-	DefaultSaveDelay     = 10 * time.Millisecond
-)
+var ErrBatchSaverClosed = errors.New("batch saver closed")
 
-var ErrSaverClosed = errors.New("saver closed")
-
-type pendingSaverConfig struct {
-	QueueSize int
-	Delay     time.Duration
-}
+type saveBatchFunc func(batch [][]model.Link) ([]uint64, error)
 
 type saveReq struct {
 	links  []model.Link
@@ -33,32 +24,34 @@ type saveResp struct {
 	err error
 }
 
-type saveBatchFunc func(ctx context.Context, batch [][]model.Link) ([]uint64, error)
-
-type pendingSaver struct {
+type batchSaver struct {
 	saveBatch saveBatchFunc
 
-	queueSize int
-	saveDelay time.Duration
+	batchSize int
+	delay     time.Duration
 
 	inputCh chan saveReq
+	flushCh chan chan error
 	closeCh chan struct{}
 	done    chan struct{}
 	closeMu sync.Mutex
 }
 
-func newPendingSaver(saveBatch saveBatchFunc, cfg pendingSaverConfig) *pendingSaver {
+func newBatchSaver(saveBatch saveBatchFunc, batchSize int, delay time.Duration) *batchSaver {
 	if saveBatch == nil {
-		panic("newSaver: saveBatch cannot be nil")
+		panic("newBatchSaver: saveBatch cannot be nil")
 	}
-
-	s := &pendingSaver{
+	if batchSize <= 0 && delay <= 0 {
+		panic("newBatchSaver: batchSize OR delay, at least one of them must be >0")
+	}
+	s := &batchSaver{
 		saveBatch: saveBatch,
 
-		queueSize: cmp.Or(max(cfg.QueueSize, 0), DefaultSaveQueueSize),
-		saveDelay: cmp.Or(max(cfg.Delay, 0), DefaultSaveDelay),
+		batchSize: batchSize,
+		delay:     delay,
 
 		inputCh: make(chan saveReq),
+		flushCh: make(chan chan error),
 		closeCh: make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -66,25 +59,21 @@ func newPendingSaver(saveBatch saveBatchFunc, cfg pendingSaverConfig) *pendingSa
 	return s
 }
 
-func (s *pendingSaver) Close() error {
-	return s.CloseCtx(context.Background())
-}
-
-func (s *pendingSaver) CloseCtx(ctx context.Context) error {
+func (s *batchSaver) Close(ctx context.Context) error {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 
 	// Проверяем, что не закрыты
 	select {
 	case <-s.closeCh:
-		return ErrSaverClosed
+		return ErrBatchSaverClosed
 	default:
 	}
 
-	// Сообщаем serve, что нужно завершиться
+	// Сообщаем serve, что нужно завершаться
 	close(s.closeCh)
 
-	// Ждем завершения или отмены контекста
+	// Ждем завершения всех операций записи или отмены контекста
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -94,7 +83,7 @@ func (s *pendingSaver) CloseCtx(ctx context.Context) error {
 	return nil
 }
 
-func (s *pendingSaver) Save(ctx context.Context, links []model.Link) (uint64, error) {
+func (s *batchSaver) Save(ctx context.Context, links []model.Link) (uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -105,11 +94,11 @@ func (s *pendingSaver) Save(ctx context.Context, links []model.Link) (uint64, er
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-s.closeCh:
-		return 0, ErrSaverClosed
+		return 0, ErrBatchSaverClosed
 	case s.inputCh <- saveReq{links: links, respCh: respCh}:
 	}
 
-	// ждем ответ или отмены контекста
+	// Ждем ответ или отмены контекста
 	var resp saveResp
 	select {
 	case <-ctx.Done():
@@ -118,6 +107,28 @@ func (s *pendingSaver) Save(ctx context.Context, links []model.Link) (uint64, er
 	}
 
 	return resp.id, resp.err
+}
+
+func (s *batchSaver) Flush(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	respCh := make(chan error, 1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.closeCh:
+		return ErrBatchSaverClosed
+	case s.flushCh <- respCh:
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-respCh:
+		return err
+	}
 }
 
 type queue struct {
@@ -146,7 +157,7 @@ func (q *queue) reset() {
 	q.respChs = q.respChs[:0]
 }
 
-func (s *pendingSaver) serve() {
+func (s *batchSaver) serve() {
 	// Фоновый процесс, который выполняет запись в базу данных.
 	// ВАЖНО: Одновременно выполняется только ОДНА задача.
 	saveCh := make(chan *queue)
@@ -167,8 +178,8 @@ func (s *pendingSaver) serve() {
 	defer tm.Stop()
 
 	// Создаем две очереди. В первую пишем, вторую скидываем в базу.
-	queue1 := newQueue(s.queueSize)
-	queue2 := newQueue(s.queueSize)
+	queue1 := newQueue(s.batchSize)
+	queue2 := newQueue(s.batchSize)
 
 	swapQueues := func() {
 		tm.Stop()
@@ -196,26 +207,26 @@ func (s *pendingSaver) serve() {
 		case req := <-s.inputCh:
 			queue1.append(req)
 			switch {
-			case queue1.len() >= s.queueSize:
-				// При достеженни порога, принудительно сбрасывам очередь.
+			case queue1.len() >= s.batchSize:
+				// При достижении порога, принудительно сбрасываем очередь.
 				// Здесь блокируемся, пока база не будет готова.
 				saveCh <- queue1
 				swapQueues()
 
 			case queue1.len() == 1:
-				tm.Reset(s.saveDelay)
+				tm.Reset(s.delay)
 			}
 		}
 	}
 }
 
 // syncSave сохраняет пачку запрос в базу одной транзакцией
-func (s *pendingSaver) syncSave(queue *queue) {
+func (s *batchSaver) syncSave(queue *queue) {
 	if queue.len() == 0 {
 		return
 	}
 
-	ids, err := s.saveBatch(context.Background(), queue.batch)
+	ids, err := s.saveBatch(queue.batch)
 
 	// Возвращаем ошибку (если есть) инициаторам запросов
 	if err != nil {

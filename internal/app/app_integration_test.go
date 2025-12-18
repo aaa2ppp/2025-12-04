@@ -134,7 +134,7 @@ func TestIntegration_FullFlow(t *testing.T) {
 	cfg := config.Config{
 		Logger:    config.Logger{Level: logLevel},
 		Server:    config.Server{Addr: addr, ShutdownTimeout: 5 * time.Second},
-		BBoltStor: config.BBoltStor{DataFile: dataFile, MaxCache: 100},
+		BBoltStor: config.BBoltStor{DataFile: dataFile, CacheSize: 100},
 		Checker:   config.Checker{Timeout: 2 * time.Second},
 	}
 
@@ -176,7 +176,7 @@ func TestIntegration_Restart(t *testing.T) {
 	cfg := config.Config{
 		Logger:    config.Logger{Level: logLevel},
 		Server:    config.Server{Addr: addr, ShutdownTimeout: 5 * time.Second},
-		BBoltStor: config.BBoltStor{DataFile: dataFile, MaxCache: 100},
+		BBoltStor: config.BBoltStor{DataFile: dataFile, CacheSize: 100},
 		Checker:   config.Checker{Timeout: 2 * time.Second},
 	}
 
