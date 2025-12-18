@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"time"
 
 	"link-checker/internal/checker"
 	"link-checker/internal/logger"
@@ -25,7 +26,8 @@ type Config struct {
 }
 
 func Load() (Config, error) {
-	defer osExitIfPrintConfig() // XXX
+	// XXX завершить программу с ошибкой, если установлена переменная окружения PRINT_CONFIG
+	defer osExitIfPrintConfig()
 
 	var ge Getenv
 
@@ -46,10 +48,14 @@ func Load() (Config, error) {
 			TryGETFallback: ge.Bool("CHECKER_TRY_GET_FALLBACK", !Required, false),
 		},
 		BBoltStor: BBoltStor{
-			DataFile: ge.String("BBOLT_DATA_FILE", Required, ""),
-			MaxCache: ge.Int("BBOLT_MAX_CACHE", !Required, bboltStor.DefaultMaxCache),
-			Timeout:  ge.Duration("BBOLT_TIMEOUT", !Required, bboltStor.DefaultTimeout),
-			NoSync:   ge.Bool("BBOLT_NOSYNC", !Required, bboltStor.DefaultNoSync),
+			DataFile:       ge.String("BBSTOR_DATA_FILE", Required, ""),
+			OpenTimeout:    ge.Duration("BBSTOR_OPEN_TIMEOUT", !Required, 1*time.Second),
+			CacheSize:      ge.Int("BBSTOR_CACHE_SIZE", !Required, 1024),
+			NoSync:         ge.Bool("BBSTOR_NO_SYNC", !Required, false),
+			MaxSyncDelay:   ge.Duration("BBSTOR_MAX_SYNC_DELAY", !Required, 0),
+			MaxSyncPending: ge.Int("BBSTOR_MAX_SYNC_PENDING", !Required, 0),
+			MaxBatchDelay:  ge.Duration("BBSTOR_MAX_BATCH_DELAY", !Required, 10*time.Millisecond),
+			MaxBatchSize:   ge.Int("BBSTOR_MAX_BATCH_SIZE", !Required, bboltStor.DefaultMaxBatchSize),
 		},
 	}
 

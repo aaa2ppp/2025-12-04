@@ -26,7 +26,8 @@ func (ge *Getenv) Err() error {
 type parseFunc[T any] func(s string) (T, error)
 
 func getValue[T any](key string, required bool, defaultValue T, parse parseFunc[T]) (val T, _ error) {
-	defer func() { printEnv(key, val, defaultValue, required) }() // XXX
+	// XXX для вывода конфигурации, если установлена переменная окружения PRINT_CONFIG
+	defer func() { printEnv(key, val, defaultValue, required) }() 
 
 	var zero T
 	s, ok := os.LookupEnv(key)

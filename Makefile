@@ -67,6 +67,10 @@ test-report: bin/json2pdf $(TMP_DIR)
 clean:
 	-rm -rf $(BIN_DIR) $(TMP_DIR)
 
+env.example: bin/app
+	PRINT_CONFIG= bin/app > env.example || true
+
+
 .PHONY: merge patch
 
 merge: ${TMP_DIR}

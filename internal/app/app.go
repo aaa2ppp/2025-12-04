@@ -29,7 +29,7 @@ func (a *App) Run(ctx context.Context, cfg config.Config) (anyErr error) {
 		return fmt.Errorf("open storage: %w", err)
 	}
 	defer func() {
-		if err := storage.Close(); err != nil {
+		if err := storage.Close(context.Background()); err != nil {
 			slog.Error("close storage", "error", err)
 			if anyErr == nil {
 				anyErr = fmt.Errorf("close storage: %w", err)

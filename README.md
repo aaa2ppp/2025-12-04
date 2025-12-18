@@ -77,7 +77,7 @@ Health-check эндпоинт. Возвращает `200 OK` с телом `"pon
 # Сборка
 make all
 
-# Запуск с сминимальной настройками
+# Запуск с минимальной настройкой
 SERVER_ADDR=:8080 BBOLT_DATA_FILE=./data/my.db ./bin/app
 
 # Конфигурация
@@ -87,7 +87,7 @@ vi .env
 
 ### Переменные окружения
 
-Подробно см. [env.exemple](./env.example)
+Подробно см. [env.example](./env.example)
 
 Пример: `.env` файл
 
@@ -95,6 +95,11 @@ vi .env
 LOG_LEVEL=DEBUG
 SERVER_ADDR=:63777
 BBOLT_DATA_FILE=./data/linksets.db
+```
+
+```bash
+# Вывести текущую конфигурацию на stdout
+PRINT_CONFIG= ./bin/app
 ```
 
 ## Архитектурные практики
