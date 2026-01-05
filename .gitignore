@@ -1,9 +1,9 @@
 .*
 !.gitignore
-.exe
-.out
-.bin
-.pprof
+*.exe
+*.out
+*.bin
+*.pprof
 todo.*
 .*/
 tmp/
