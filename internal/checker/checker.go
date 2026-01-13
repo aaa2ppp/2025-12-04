@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"link-checker/internal/model"
@@ -16,16 +16,27 @@ import (
 )
 
 const (
-	DefaultUserAgent           = "LinkChecker/1.0"
+	DefaultUserAgent   = "LinkChecker/1.0"
+	DefaultMaxRequests = 20
+
 	DefaultTimeout             = 10 * time.Second
 	DefaultMaxIdleConns        = 100
 	DefaultMaxIdleConnsPerHost = 10
 	DefaultIdleConnTimeout     = 90 * time.Second
+
+	maxWorkerIdle = 10 * time.Second
+)
+
+var (
+	ErrClosed = errors.New("checker closed")
 )
 
 type Config struct {
+	UserAgent   string
+	MaxRequests int
+
+	// http client config
 	Timeout             time.Duration
-	UserAgent           string
 	TryHTTPSFirst       bool
 	TryGETFallback      bool // сейчас игнорируется, всегда false
 	MaxIdleConns        int
@@ -38,16 +49,14 @@ type Checker struct {
 	userAgent      string
 	tryHTTPSFirst  bool
 	tryGETFallback bool
+	workerSlots    chan struct{}
+	workerCount    int
+	maxWorkerIdle  time.Duration
+	jobs           chan job
+	closed         atomic.Bool
 }
 
 func New(cfg Config) *Checker {
-	if cfg.Timeout == 0 {
-		cfg.Timeout = DefaultTimeout
-	}
-	if cfg.UserAgent == "" {
-		cfg.UserAgent = "LinkChecker/1.0"
-	}
-
 	client := &http.Client{
 		Timeout: cmp.Or(cfg.Timeout, DefaultTimeout),
 		Transport: &http.Transport{
@@ -57,27 +66,91 @@ func New(cfg Config) *Checker {
 		},
 	}
 
+	workerCount := cfg.MaxRequests
+	if workerCount <= 0 {
+		workerCount = DefaultMaxRequests
+	}
+	workerSlots := make(chan struct{}, workerCount)
+	for i := 0; i < workerCount; i++ {
+		workerSlots <- struct{}{}
+	}
+
 	return &Checker{
 		client:         client,
 		userAgent:      cmp.Or(cfg.UserAgent, DefaultUserAgent),
 		tryHTTPSFirst:  cfg.TryHTTPSFirst,
 		tryGETFallback: false, // TODO: должно быть cfg.TryGETFallback после реализации tryGET()
+		workerSlots:    workerSlots,
+		workerCount:    workerCount,
+		jobs:           make(chan job),
+		maxWorkerIdle:  maxWorkerIdle,
 	}
 }
 
-func (c *Checker) Check(ctx context.Context, rawURLs []string) ([]model.Link, error) {
-	links := make([]model.Link, len(rawURLs))
-	var wg sync.WaitGroup
+func (c *Checker) Close() error {
+	if c.closed.Swap(true) {
+		return ErrClosed
+	}
+	c.closed.Store(true)
+	close(c.jobs)
+	for i := 0; i < c.workerCount; i++ {
+		<-c.workerSlots
+	}
+	return nil
+}
 
-	wg.Add(len(rawURLs))
-	for i, rawURL := range rawURLs {
-		go func(i int, rawURL string) {
-			defer wg.Done()
-			links[i] = c.checkOne(ctx, rawURL)
-		}(i, rawURL)
+type job struct {
+	ctx     context.Context
+	checker *Checker
+	rawURL  string
+	result  *model.Link
+	done    chan<- struct{}
+}
+
+func (j *job) run() {
+	*j.result = j.checker.checkOne(j.ctx, j.rawURL)
+	j.done <- struct{}{}
+}
+
+func (c *Checker) Check(ctx context.Context, rawURLs []string) ([]model.Link, error) {
+	if c.closed.Load() {
+		return nil, ErrClosed
 	}
 
-	wg.Wait()
+	links := make([]model.Link, len(rawURLs))
+	done := make(chan struct{}, len(rawURLs))
+
+	for i, rawURL := range rawURLs {
+		job := job{
+			ctx:     ctx,
+			checker: c,
+			rawURL:  rawURL,
+			result:  &links[i],
+			done:    done,
+		}
+
+		select {
+		case c.jobs <- job:
+		default:
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case c.jobs <- job:
+			case <-c.workerSlots:
+				go func() {
+					defer func() {
+						c.workerSlots <- struct{}{}
+					}()
+					runWorker(job, c.maxWorkerIdle, c.jobs)
+				}()
+			}
+		}
+	}
+
+	for i := 0; i < len(links); i++ {
+		<-done
+	}
+
 	return links, nil
 }
 
